@@ -4,17 +4,12 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'AIHDRCamera-Android-Source.zip'
+      - 'AIHDRCamera-Android/**'
       - '.github/workflows/android.yml'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
@@ -25,27 +20,23 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Gradle
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
-
-      - name: Install Android SDK 35
-        run: "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
-
-      - name: Extract Android project
-        run: |
-          unzip -q AIHDRCamera-Android-Source.zip -d extracted
-
-      - name: Build APK
-        working-directory: extracted/AIHDRCamera-Android
+      - name: Build native Android app
+        working-directory: AIHDRCamera-Android
         run: gradle --no-daemon :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: AIHDRCamera-APK
-          path: extracted/AIHDRCamera-Android/app/build/outputs/apk/debug/app-debug.apk
+          path: AIHDRCamera-Android/app/build/outputs/apk/debug/app-debug.apk
