@@ -41,8 +41,7 @@ class Camera2HdrCapture(context: Context) {
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                 set(CaptureRequest.JPEG_QUALITY, 96.toByte())
             }.build()
-            session.capture(request, null, handler)
-            queue.poll(8, TimeUnit.SECONDS) ?: error("Camera did not return a JPEG.")
+            captureJpeg(session, request, queue).first
         }
 
     fun captureHdr(ev: Double, front: Boolean): ByteArray =
@@ -63,20 +62,9 @@ class Camera2HdrCapture(context: Context) {
                 set(CaptureRequest.JPEG_QUALITY, 96.toByte())
             }.build()
 
-            session.capture(meterRequest, object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: exposureNs
-                    sensitivity = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: sensitivity
-                    metered.countDown()
-                }
-            }, handler)
-
-            check(metered.await(4, TimeUnit.SECONDS)) { "Camera exposure metering timed out." }
-            queue.poll(4, TimeUnit.SECONDS) // discard the metering frame
+            val (_, meterResult) = captureJpeg(session, meterRequest, queue)
+            exposureNs = meterResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: exposureNs
+            sensitivity = meterResult.get(CaptureResult.SENSOR_SENSITIVITY) ?: sensitivity
 
             val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
             val manualSensor = capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
@@ -129,11 +117,55 @@ class Camera2HdrCapture(context: Context) {
                         }
                     }
                 }.build()
-                session.capture(request, null, handler)
-                frames += queue.poll(8, TimeUnit.SECONDS) ?: error("An HDR frame timed out.")
+                frames += captureJpeg(session, request, queue).first
             }
             HdrFusion.merge(frames)
         }
+
+    private fun captureJpeg(
+        session: CameraCaptureSession,
+        request: CaptureRequest,
+        queue: ArrayBlockingQueue<ByteArray>
+    ): Pair<ByteArray, TotalCaptureResult> {
+        // Remove any image left by a previous request before starting this one.
+        queue.clear()
+        val completed = CountDownLatch(1)
+        var captureResult: TotalCaptureResult? = null
+        var captureError: Throwable? = null
+
+        session.capture(request, object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult
+            ) {
+                captureResult = result
+                completed.countDown()
+            }
+
+            override fun onCaptureFailed(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                failure: CameraCaptureSession.CaptureFailure
+            ) {
+                captureError = IllegalStateException(
+                    "Camera capture failed (reason ${failure.reason}, frame ${failure.frameNumber})."
+                )
+                completed.countDown()
+            }
+
+            override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                captureError = IllegalStateException("Camera capture sequence was aborted.")
+                completed.countDown()
+            }
+        }, handler)
+
+        check(completed.await(8, TimeUnit.SECONDS)) { "Camera capture callback timed out." }
+        captureError?.let { throw it }
+        val jpeg = queue.poll(8, TimeUnit.SECONDS)
+            ?: error("Camera completed the capture but did not deliver a JPEG image.")
+        return jpeg to (captureResult ?: error("Camera returned no capture metadata."))
+    }
 
     private fun <T> withCamera(
         front: Boolean,
@@ -225,9 +257,26 @@ private object HdrFusion {
         val fused = Mat()
         val output = Mat()
         try {
-            require(source.all { !it.empty() }) { "A captured frame could not be decoded." }
+            require(source.size == 3 && source.all { !it.empty() }) {
+                "HDR capture returned an empty or undecodable frame. Please try again."
+            }
+            val reference = source.first()
+            require(source.all { it.rows() == reference.rows() && it.cols() == reference.cols() }) {
+                "HDR frames have different dimensions and cannot be combined."
+            }
+
             Photo.createAlignMTB().process(source, aligned)
-            Photo.createMergeMertens().process(aligned, fused)
+            // Some device/OpenCV combinations can return no aligned outputs.
+            // In that case, use the validated decoded frames rather than passing
+            // an empty list into MergeMertens (which triggers !images.empty()).
+            val fusionInputs = if (aligned.size == source.size && aligned.all { !it.empty() }) {
+                aligned
+            } else {
+                source
+            }
+            require(fusionInputs.isNotEmpty()) { "No valid images were available for HDR fusion." }
+            Photo.createMergeMertens().process(fusionInputs, fused)
+            require(!fused.empty()) { "HDR fusion produced no output image." }
             fused.convertTo(output, CvType.CV_8UC3, 255.0)
 
             val lab = Mat()
