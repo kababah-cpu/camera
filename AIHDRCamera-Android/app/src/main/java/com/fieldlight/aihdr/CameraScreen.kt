@@ -183,7 +183,7 @@ fun CameraScreen() {
                                             }
                                             val bytes = if (hdrEnabled) camera.captureHdr(exposureBoost.toDouble(), frontCamera)
                                                 else camera.captureStandard(frontCamera)
-                                            savePhoto(bytes)
+                                            savePhoto(context, bytes)
                                         } catch (error: Exception) {
                                             Result.failure<Uri>(error)
                                         }
@@ -224,10 +224,9 @@ fun CameraScreen() {
     }
 }
 
-private fun savePhoto(jpeg: ByteArray): Result<Uri> {
+private fun savePhoto(context: android.content.Context, jpeg: ByteArray): Result<Uri> {
     return try {
-        val resolver = AppContextHolder.context?.contentResolver
-            ?: return Result.failure(IllegalStateException("Photo storage is unavailable."))
+        val resolver = context.contentResolver
         val name = "AIHDR_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
