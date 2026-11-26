@@ -21,6 +21,7 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
     @Volatile private var device: CameraDevice? = null
     @Volatile private var session: CameraCaptureSession? = null
     @Volatile private var view: TextureView? = null
+    @Volatile private var previewSurface: Surface? = null
     @Volatile private var frontFacing = false
 
     fun attach(textureView: TextureView, front: Boolean = false) {
@@ -54,8 +55,14 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
             } ?: Size(1280, 720)
             texture.setDefaultBufferSize(size.width, size.height)
             val surface = Surface(texture)
+            previewSurface = surface
             manager.openCamera(id, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (previewSurface !== surface) {
+                        camera.close()
+                        surface.release()
+                        return
+                    }
                     device = camera
                     val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         addTarget(surface)
@@ -65,6 +72,10 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
                     }.build()
                     camera.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(value: CameraCaptureSession) {
+                            if (device !== camera || previewSurface !== surface) {
+                                value.close()
+                                return
+                            }
                             session = value
                             try { value.setRepeatingRequest(request, null, handler) } catch (_: Exception) { }
                         }
@@ -96,6 +107,8 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
         try { device?.close() } catch (_: Exception) { }
         session = null
         device = null
+        try { previewSurface?.release() } catch (_: Exception) { }
+        previewSurface = null
     }
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
