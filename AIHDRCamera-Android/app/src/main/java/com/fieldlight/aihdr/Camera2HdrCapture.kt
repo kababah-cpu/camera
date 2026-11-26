@@ -7,6 +7,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.media.ImageReader
@@ -145,7 +146,7 @@ class Camera2HdrCapture(context: Context) {
             override fun onCaptureFailed(
                 session: CameraCaptureSession,
                 request: CaptureRequest,
-                failure: CameraCaptureSession.CaptureFailure
+                failure: CaptureFailure
             ) {
                 captureError = IllegalStateException(
                     "Camera capture failed (reason ${failure.reason}, frame ${failure.frameNumber})."
