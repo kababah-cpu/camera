@@ -1,0 +1,251 @@
+package com.fieldlight.aihdr
+
+import android.Manifest
+import android.content.ContentValues
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.SurfaceTexture
+import android.net.Uri
+import android.os.Build
+import android.provider.MediaStore
+import android.view.TextureView
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.opencv.android.OpenCVLoader
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+@Composable
+fun CameraScreen() {
+    val context = LocalContext.current
+    val activity = context as? android.app.Activity
+    val scope = rememberCoroutineScope()
+    var hasPermission by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
+    }
+    var hdrEnabled by remember { mutableStateOf(true) }
+    var exposureBoost by remember { mutableStateOf(0f) }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("Ready") }
+    var lastPhoto by remember { mutableStateOf<Uri?>(null) }
+    var frontCamera by remember { mutableStateOf(false) }
+    var textureView by remember { mutableStateOf<TextureView?>(null) }
+    val preview = remember { CameraPreviewController(context) }
+    val camera = remember { Camera2HdrCapture(context) }
+
+    val permissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        hasPermission = it
+        if (it) textureView?.let { view -> preview.attach(view, frontCamera) }
+    }
+
+    LaunchedEffect(hasPermission, textureView) {
+        if (hasPermission) textureView?.let { preview.attach(it, frontCamera) }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            preview.release()
+            camera.close()
+        }
+    }
+
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { viewContext ->
+                TextureView(viewContext).also { view ->
+                    textureView = view
+                    if (hasPermission) preview.attach(view, frontCamera)
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        Column(
+            modifier = Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("FIELDLIGHT", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelMedium)
+                    Text("AI HDR CAMERA", color = Color.White, style = MaterialTheme.typography.titleLarge)
+                }
+                Surface(color = Color.Black.copy(alpha = 0.48f), shape = RoundedCornerShape(20.dp)) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(if (hdrEnabled) "HDR" else "STANDARD", color = Color.White)
+                        Spacer(Modifier.size(8.dp))
+                        Switch(checked = hdrEnabled, onCheckedChange = { hdrEnabled = it })
+                    }
+                }
+            }
+
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                if (!hasPermission) {
+                    Text("Camera permission is needed to show the viewfinder.", color = Color.White)
+                    Spacer(Modifier.height(12.dp))
+                    Button(onClick = { permissionRequest.launch(Manifest.permission.CAMERA) }) {
+                        Text("Allow camera")
+                    }
+                } else {
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.58f),
+                        shape = RoundedCornerShape(18.dp)
+                    ) {
+                        Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                            Text("LIGHTING BOOST", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                            Slider(
+                                value = exposureBoost,
+                                onValueChange = { exposureBoost = it },
+                                valueRange = -1f..2f,
+                                enabled = hdrEnabled
+                            )
+                            Text(String.format(Locale.US, "%+.1f EV", exposureBoost), color = Color.White)
+                        }
+                    }
+                    Spacer(Modifier.height(18.dp))
+                    Text(status, color = Color.White, style = MaterialTheme.typography.bodyMedium)
+                    Spacer(Modifier.height(18.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = {
+                                lastPhoto?.let { uri ->
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(uri, "image/jpeg")
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(intent)
+                                }
+                            },
+                            enabled = lastPhoto != null,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
+                        ) { Text("Last photo") }
+
+                        Button(
+                            onClick = {
+                                if (busy) return@Button
+                                busy = true
+                                status = if (hdrEnabled) "Capturing exposures…" else "Capturing photo…"
+                                preview.stopPreview()
+                                scope.launch {
+                                    val result = withContext(Dispatchers.IO) {
+                                        try {
+                                            if (hdrEnabled && !OpenCVLoader.initLocal()) {
+                                                error("OpenCV could not initialize. Standard mode is still available.")
+                                            }
+                                            val bytes = if (hdrEnabled) camera.captureHdr(exposureBoost.toDouble(), frontCamera)
+                                                else camera.captureStandard(frontCamera)
+                                            savePhoto(bytes)
+                                        } catch (error: Exception) {
+                                            Result.failure<Uri>(error)
+                                        }
+                                    }
+                                    result.fold(
+                                        onSuccess = {
+                                            lastPhoto = it
+                                            status = "Photo saved to your gallery"
+                                        },
+                                        onFailure = {
+                                            status = it.message ?: "Capture failed"
+                                        }
+                                    )
+                                    textureView?.surfaceTexture?.let { preview.startPreview(it) }
+                                    busy = false
+                                }
+                            },
+                            enabled = !busy && hasPermission,
+                            shape = CircleShape,
+                            modifier = Modifier.size(82.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFC857), contentColor = Color.Black)
+                        ) {
+                            if (busy) CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(30.dp))
+                            else Text("SHOOT", style = MaterialTheme.typography.labelLarge)
+                        }
+
+                        Button(
+                            onClick = {
+                                frontCamera = !frontCamera
+                                preview.setFacing(frontCamera)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
+                        ) { Text("Flip") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun savePhoto(jpeg: ByteArray): Result<Uri> {
+    return try {
+        val resolver = AppContextHolder.context?.contentResolver
+            ?: return Result.failure(IllegalStateException("Photo storage is unavailable."))
+        val name = "AIHDR_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/AI HDR Camera")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
+            }
+        }
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: error("Could not create a gallery photo.")
+        resolver.openOutputStream(uri)?.use { it.write(jpeg) } ?: error("Could not write the photo.")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val complete = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+            resolver.update(uri, complete, null, null)
+        }
+        Result.success(uri)
+    } catch (error: Exception) {
+        Result.failure(error)
+    }
+}
