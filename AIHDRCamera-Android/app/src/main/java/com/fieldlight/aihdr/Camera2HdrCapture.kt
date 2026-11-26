@@ -48,7 +48,6 @@ class Camera2HdrCapture(context: Context) {
         withCamera(front) { device, session, reader, queue, characteristics ->
             var exposureNs = 10_000_000L
             var sensitivity = 200
-            val metered = CountDownLatch(1)
             val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
             val afMode = if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO))
                 CaptureRequest.CONTROL_AF_MODE_AUTO else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
@@ -265,7 +264,12 @@ private object HdrFusion {
                 "HDR frames have different dimensions and cannot be combined."
             }
 
-            Photo.createAlignMTB().process(source, aligned)
+            try {
+                Photo.createAlignMTB().process(source, aligned)
+            } catch (_: Exception) {
+                // Alignment is optional; validated source frames can still be fused.
+                aligned.clear()
+            }
             // Some device/OpenCV combinations can return no aligned outputs.
             // In that case, use the validated decoded frames rather than passing
             // an empty list into MergeMertens (which triggers !images.empty()).
