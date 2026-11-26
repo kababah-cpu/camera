@@ -93,7 +93,6 @@ fun CameraScreen() {
             factory = { viewContext ->
                 TextureView(viewContext).also { view ->
                     textureView = view
-                    if (hasPermission) preview.attach(view, frontCamera)
                 }
             },
             modifier = Modifier.fillMaxSize()
