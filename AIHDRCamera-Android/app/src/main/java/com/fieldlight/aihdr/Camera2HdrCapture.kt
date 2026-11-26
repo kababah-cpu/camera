@@ -306,11 +306,15 @@ class Camera2HdrCapture(context: Context) {
 private object HdrFusion {
     fun merge(jpegs: List<ByteArray>): ByteArray {
         require(jpegs.size == 3) { "HDR processing requires three frames." }
-        val source = jpegs.map { Imgcodecs.imdecode(MatOfByte(*it), Imgcodecs.IMREAD_COLOR) }
+        val encodedInputs = jpegs.map { MatOfByte(*it) }
+        val source = ArrayList<Mat>()
         val aligned = ArrayList<Mat>()
         val fused = Mat()
         val output = Mat()
         try {
+            encodedInputs.forEach { bytes ->
+                source += Imgcodecs.imdecode(bytes, Imgcodecs.IMREAD_COLOR)
+            }
             require(source.size == 3 && source.all { !it.empty() }) {
                 "HDR capture returned an empty or undecodable frame. Please try again."
             }
@@ -322,51 +326,85 @@ private object HdrFusion {
             try {
                 Photo.createAlignMTB().process(source, aligned)
             } catch (_: Exception) {
-                // Alignment is optional; validated source frames can still be fused.
+                // Continue with the decoded frames if alignment is unavailable.
                 aligned.clear()
             }
-            // Some device/OpenCV combinations can return no aligned outputs.
-            // In that case, use the validated decoded frames rather than passing
-            // an empty list into MergeMertens (which triggers !images.empty()).
-            val fusionInputs = if (aligned.size == source.size && aligned.all { !it.empty() }) {
-                aligned
-            } else {
-                source
-            }
-            require(fusionInputs.isNotEmpty()) { "No valid images were available for HDR fusion." }
-            Photo.createMergeMertens().process(fusionInputs, fused)
+            val fusionInputs = if (aligned.size == source.size && aligned.all { !it.empty() }) aligned else source
+            require(fusionInputs.size == 3) { "Three valid images are required for HDR fusion." }
+
+            // Slightly favor well-exposed regions while keeping contrast and saturation
+            // weights restrained to avoid an over-processed, overly vivid result.
+            Photo.createMergeMertens(0.9f, 0.8f, 1.1f).process(fusionInputs, fused)
             require(!fused.empty()) { "HDR fusion produced no output image." }
             fused.convertTo(output, CvType.CV_8UC3, 255.0)
 
+            // Perform tone mapping on luminance only. This lifts dark architectural
+            // detail while leaving the sky's chroma and bright-end detail intact.
             val lab = Mat()
             val channels = ArrayList<Mat>()
+            val toneCurve = Mat(1, 256, CvType.CV_8UC1)
+            val localContrast = Mat()
+            val blendedLuma = Mat()
+            val blurredLuma = Mat()
+            val sharpenedLuma = Mat()
             try {
                 Imgproc.cvtColor(output, lab, Imgproc.COLOR_BGR2Lab)
                 Core.split(lab, channels)
-                val clahe = Imgproc.createCLAHE(1.8, CvSize(8.0, 8.0))
-                val enhanced = Mat()
+                val luma = channels[0]
+
+                val curve = ByteArray(256) { value ->
+                    val x = value / 255.0
+                    // A restrained shadow lift that approaches zero in highlights.
+                    val mapped = (x + 12.0 * (1.0 - x) * (1.0 - x)).coerceIn(0.0, 1.0)
+                    (mapped * 255.0).toInt().toByte()
+                }
+                toneCurve.put(0, 0, curve)
+                Core.LUT(luma, toneCurve, localContrast)
+
+                val clahe = Imgproc.createCLAHE(1.25, CvSize(12.0, 12.0))
                 try {
-                    clahe.apply(channels[0], enhanced)
-                    enhanced.copyTo(channels[0])
-                    Core.merge(channels, lab)
-                    Imgproc.cvtColor(lab, output, Imgproc.COLOR_Lab2BGR)
+                    val claheLuma = Mat()
+                    try {
+                        clahe.apply(localContrast, claheLuma)
+                        // Blend gently: retain the global tonal structure and use CLAHE
+                        // only to reveal local detail in shaded walls, trees and windows.
+                        Core.addWeighted(localContrast, 0.68, claheLuma, 0.32, 0.0, blendedLuma)
+                    } finally {
+                        // claheLuma is released after its contribution has been blended.
+                        // The output Mat owns its own pixel data.
+                    }
                 } finally {
-                    enhanced.release()
                     clahe.collectGarbage()
                 }
+
+                // Very mild luminance-only sharpening restores edge definition without
+                // creating colored halos around rooflines, branches or building edges.
+                Imgproc.GaussianBlur(blendedLuma, blurredLuma, CvSize(0.0, 0.0), 1.0)
+                Core.addWeighted(blendedLuma, 1.10, blurredLuma, -0.10, 0.0, sharpenedLuma)
+                sharpenedLuma.copyTo(channels[0])
+                Core.merge(channels, lab)
+                Imgproc.cvtColor(lab, output, Imgproc.COLOR_Lab2BGR)
             } finally {
                 channels.forEach { it.release() }
                 lab.release()
+                toneCurve.release()
+                localContrast.release()
+                blendedLuma.release()
+                blurredLuma.release()
+                sharpenedLuma.release()
             }
 
             val encoded = MatOfByte()
             try {
-                check(Imgcodecs.imencode(".jpg", output, encoded)) { "Could not encode the fused photo." }
+                check(Imgcodecs.imencode(".jpg", output, encoded)) {
+                    "Could not encode the fused photo."
+                }
                 return encoded.toArray()
             } finally {
                 encoded.release()
             }
         } finally {
+            encodedInputs.forEach { it.release() }
             source.forEach { it.release() }
             aligned.forEach { it.release() }
             fused.release()
