@@ -77,15 +77,21 @@ class Camera2HdrCapture(context: Context) {
                 (compensationRange.lower < 0 || compensationRange.upper > 0)
             val canBracketManually = manualSensor && exposureRange != null && isoRange != null
 
+            // Keep the metering/AF capture above, but submit all three bracketed
+            // still requests in one Camera2 burst. Waiting for each JPEG before
+            // submitting the next request unnecessarily stretches the capture window.
             val offsets = listOf(-2.0, 0.0, 2.0)
-            val frames = ArrayList<ByteArray>(3)
-            for (offset in offsets) {
+            val requests = offsets.mapIndexed { index, offset ->
                 val targetEv = (offset + ev).coerceIn(-3.0, 3.0)
-                val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                     addTarget(reader.surface)
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                     set(CaptureRequest.CONTROL_AF_MODE, afMode)
-                    set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                    set(
+                        CaptureRequest.CONTROL_AF_TRIGGER,
+                        if (index == 0) CaptureRequest.CONTROL_AF_TRIGGER_START
+                        else CaptureRequest.CONTROL_AF_TRIGGER_IDLE
+                    )
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                     if (characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true) {
                         set(CaptureRequest.CONTROL_AWB_LOCK, true)
@@ -103,22 +109,22 @@ class Camera2HdrCapture(context: Context) {
                         canBracketWithAe -> {
                             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                             val stepEv = compensationStep!!.toFloat()
-                            val steps = (targetEv / stepEv).toInt()
+                            val steps = kotlin.math.round(targetEv / stepEv).toInt()
                             set(
                                 CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
                                 steps.coerceIn(compensationRange!!.lower, compensationRange.upper)
                             )
                         }
                         else -> {
-                            // Unsupported devices get three same-exposure frames for software
-                            // alignment/fusion instead of three requests all silently clamped to zero.
+                            // Devices without bracketing support still capture three
+                            // consecutive frames, but cannot provide distinct exposure levels.
                             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                             set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
                         }
                     }
                 }.build()
-                frames += captureJpeg(session, request, queue).first
             }
+            val frames = captureBurstJpegs(session, requests, queue)
             HdrFusion.merge(frames)
         }
 
@@ -165,6 +171,54 @@ class Camera2HdrCapture(context: Context) {
         val jpeg = queue.poll(8, TimeUnit.SECONDS)
             ?: error("Camera completed the capture but did not deliver a JPEG image.")
         return jpeg to (captureResult ?: error("Camera returned no capture metadata."))
+    }
+
+    private fun captureBurstJpegs(
+        session: CameraCaptureSession,
+        requests: List<CaptureRequest>,
+        queue: ArrayBlockingQueue<ByteArray>
+    ): List<ByteArray> {
+        require(requests.size == 3) { "HDR burst must contain exactly three requests." }
+        queue.clear()
+        val sequenceCompleted = CountDownLatch(1)
+        var captureError: Throwable? = null
+
+        session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureFailed(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                failure: CaptureFailure
+            ) {
+                if (captureError == null) {
+                    captureError = IllegalStateException(
+                        "HDR burst frame failed (reason ${failure.reason}, frame ${failure.frameNumber})."
+                    )
+                }
+            }
+
+            override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                captureError = IllegalStateException("HDR capture burst was aborted.")
+                sequenceCompleted.countDown()
+            }
+
+            override fun onCaptureSequenceCompleted(
+                session: CameraCaptureSession,
+                sequenceId: Int,
+                frameNumber: Long
+            ) {
+                sequenceCompleted.countDown()
+            }
+        }, handler)
+
+        check(sequenceCompleted.await(12, TimeUnit.SECONDS)) {
+            "HDR capture burst timed out."
+        }
+        captureError?.let { throw it }
+
+        return List(requests.size) {
+            queue.poll(8, TimeUnit.SECONDS)
+                ?: error("HDR burst completed but a JPEG frame was not delivered.")
+        }
     }
 
     private fun <T> withCamera(
