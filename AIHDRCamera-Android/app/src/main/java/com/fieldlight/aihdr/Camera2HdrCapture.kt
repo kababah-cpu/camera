@@ -50,7 +50,7 @@ class Camera2HdrCapture(context: Context) {
             var exposureNs = 10_000_000L
             var sensitivity = 200
             val metered = CountDownLatch(1)
-            val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES).orEmpty()
+            val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
             val afMode = if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO))
                 CaptureRequest.CONTROL_AF_MODE_AUTO else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
 
@@ -78,7 +78,7 @@ class Camera2HdrCapture(context: Context) {
             check(metered.await(4, TimeUnit.SECONDS)) { "Camera exposure metering timed out." }
             queue.poll(4, TimeUnit.SECONDS) // discard the metering frame
 
-            val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES).orEmpty()
+            val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
             val manualSensor = capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
             val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
             val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
