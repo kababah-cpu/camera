@@ -370,8 +370,7 @@ private object HdrFusion {
                         // only to reveal local detail in shaded walls, trees and windows.
                         Core.addWeighted(localContrast, 0.68, claheLuma, 0.32, 0.0, blendedLuma)
                     } finally {
-                        // claheLuma is released after its contribution has been blended.
-                        // The output Mat owns its own pixel data.
+                        claheLuma.release()
                     }
                 } finally {
                     clahe.collectGarbage()
