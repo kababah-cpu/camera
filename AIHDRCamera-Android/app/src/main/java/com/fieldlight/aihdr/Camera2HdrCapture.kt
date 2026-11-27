@@ -51,6 +51,7 @@ data class HdrCaptureDiagnostics(
     val motionMaskRawCoveragePercent: Double,
     val motionMaskThreshold: Double,
     val motionMaskRejected: Boolean,
+    val middleExposureContributionPercent: Double,
     val exposureRatio: Double?,
     val opencvThreads: Int,
     val alignmentMaxBits: Int
@@ -76,6 +77,7 @@ data class HdrCaptureDiagnostics(
         appendLine("Motion ghost suppression: ${motionSuppressionMs} ms")
         appendLine("Motion mask raw coverage: ${"%.1f".format(Locale.US, motionMaskRawCoveragePercent)}%")
         appendLine("Motion mask accepted coverage: ${"%.1f".format(Locale.US, motionMaskCoveragePercent)}%")
+        appendLine("Middle-exposure contribution: ${"%.1f".format(Locale.US, middleExposureContributionPercent)}%")
         appendLine("Motion mask adaptive threshold: ${"%.1f".format(Locale.US, motionMaskThreshold)} / 255")
         appendLine("Motion mask rejected by HDR-preservation guard: ${if (motionMaskRejected) "YES" else "NO"}")
         appendLine("OpenCV processing threads: ${opencvThreads}")
@@ -99,7 +101,8 @@ private data class HdrFusionTimings(
     val motionMaskCoveragePercent: Double,
     val motionMaskRawCoveragePercent: Double,
     val motionMaskThreshold: Double,
-    val motionMaskRejected: Boolean
+    val motionMaskRejected: Boolean,
+    val middleExposureContributionPercent: Double
 )
 
 private data class HdrFusionOutput(val jpeg: ByteArray, val timings: HdrFusionTimings)
@@ -108,7 +111,8 @@ private data class MotionSuppressionResult(
     val rawCoveragePercent: Double,
     val acceptedCoveragePercent: Double,
     val adaptiveThreshold: Double,
-    val rejected: Boolean
+    val rejected: Boolean,
+    val middleExposureContributionPercent: Double
 )
 
 class Camera2HdrCapture(context: Context) {
@@ -262,6 +266,7 @@ class Camera2HdrCapture(context: Context) {
                 motionMaskRawCoveragePercent = fusionOutput.timings.motionMaskRawCoveragePercent,
                 motionMaskThreshold = fusionOutput.timings.motionMaskThreshold,
                 motionMaskRejected = fusionOutput.timings.motionMaskRejected,
+                middleExposureContributionPercent = fusionOutput.timings.middleExposureContributionPercent,
                 exposureRatio = null,
                 opencvThreads = Core.getNumThreads(),
                 alignmentMaxBits = HdrFusion.ALIGNMENT_MAX_BITS
@@ -527,6 +532,7 @@ class Camera2HdrCapture(context: Context) {
 private object HdrFusion {
     const val ALIGNMENT_MAX_BITS = 5
     private const val OPENCV_THREADS = 4
+    private const val MAX_MOTION_MASK_COVERAGE_PERCENT = 80.0
 
     fun merge(jpegs: List<ByteArray>): HdrFusionOutput {
         require(jpegs.size == 3) { "HDR processing requires three frames." }
@@ -645,7 +651,8 @@ private object HdrFusion {
                         motionResult.acceptedCoveragePercent,
                         motionResult.rawCoveragePercent,
                         motionResult.adaptiveThreshold,
-                        motionResult.rejected
+                        motionResult.rejected,
+                        motionResult.middleExposureContributionPercent
                     )
                 )
             } finally {
@@ -733,9 +740,11 @@ private object HdrFusion {
             val rawCoverage = Core.countNonZero(combinedMask).toDouble() * 100.0 / totalPixels
             Imgproc.dilate(combinedMask, dilatedMask, kernel)
             val dilatedCoverage = Core.countNonZero(dilatedMask).toDouble() * 100.0 / totalPixels
-            // Never let a noisy/global mask silently turn the HDR result into
-            // a middle-exposure image. Reject masks covering more than 35%.
-            val rejected = dilatedCoverage > 35.0
+            // Permit broad motion detection, but reject only when the mask is
+            // so extensive that selective HDR contribution becomes unreliable.
+            // Coverage is not the same as replacement: the soft mask controls
+            // the actual middle-exposure contribution pixel by pixel.
+            val rejected = dilatedCoverage > MAX_MOTION_MASK_COVERAGE_PERCENT
             if (rejected) dilatedMask.setTo(Scalar(0.0))
             dilatedMask.convertTo(maskFloat, CvType.CV_32FC1, 1.0 / 255.0)
             Imgproc.GaussianBlur(maskFloat, softMask, CvSize(0.0, 0.0), 0.9)
@@ -764,11 +773,13 @@ private object HdrFusion {
             composite.copyTo(fused)
 
             val acceptedCoverage = if (rejected) 0.0 else dilatedCoverage
+            val middleContribution = if (rejected) 0.0 else Core.mean(softMask).get(0, 0)[0] * 100.0
             return MotionSuppressionResult(
                 rawCoveragePercent = rawCoverage,
                 acceptedCoveragePercent = acceptedCoverage,
                 adaptiveThreshold = thresholdSum / 2.0,
-                rejected = rejected
+                rejected = rejected,
+                middleExposureContributionPercent = middleContribution
             )
         } finally {
             referenceGray.release()
