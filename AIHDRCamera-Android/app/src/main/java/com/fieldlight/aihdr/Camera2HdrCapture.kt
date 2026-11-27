@@ -21,6 +21,7 @@ import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfByte
+import org.opencv.core.MatOfDouble
 import org.opencv.core.Scalar
 import org.opencv.core.Size as CvSize
 import org.opencv.imgcodecs.Imgcodecs
@@ -43,6 +44,9 @@ data class HdrCaptureDiagnostics(
     val jpegEncodingMs: Long,
     val motionSuppressionMs: Long,
     val motionMaskCoveragePercent: Double,
+    val motionMaskRawCoveragePercent: Double,
+    val motionMaskThreshold: Double,
+    val motionMaskRejected: Boolean,
     val exposureRatio: Double?,
     val opencvThreads: Int,
     val alignmentMaxBits: Int
@@ -62,7 +66,10 @@ data class HdrCaptureDiagnostics(
         appendLine("Tone/contrast/sharpening: ${finishingMs} ms")
         appendLine("JPEG encoding: ${jpegEncodingMs} ms")
         appendLine("Motion ghost suppression: ${motionSuppressionMs} ms")
-        appendLine("Motion mask coverage: ${"%.1f".format(Locale.US, motionMaskCoveragePercent)}%")
+        appendLine("Motion mask raw coverage: ${"%.1f".format(Locale.US, motionMaskRawCoveragePercent)}%")
+        appendLine("Motion mask accepted coverage: ${"%.1f".format(Locale.US, motionMaskCoveragePercent)}%")
+        appendLine("Motion mask adaptive threshold: ${"%.1f".format(Locale.US, motionMaskThreshold)} / 255")
+        appendLine("Motion mask rejected by HDR-preservation guard: ${if (motionMaskRejected) "YES" else "NO"}")
         appendLine("OpenCV processing threads: ${opencvThreads}")
         appendLine("Alignment pyramid max bits: ${alignmentMaxBits}")
         exposureRatio?.let { appendLine("Measured exposure ratio: ${"%.2f".format(Locale.US, it)}x") }
@@ -78,10 +85,20 @@ private data class HdrFusionTimings(
     val finishingMs: Long,
     val jpegEncodingMs: Long,
     val motionSuppressionMs: Long,
-    val motionMaskCoveragePercent: Double
+    val motionMaskCoveragePercent: Double,
+    val motionMaskRawCoveragePercent: Double,
+    val motionMaskThreshold: Double,
+    val motionMaskRejected: Boolean
 )
 
 private data class HdrFusionOutput(val jpeg: ByteArray, val timings: HdrFusionTimings)
+
+private data class MotionSuppressionResult(
+    val rawCoveragePercent: Double,
+    val acceptedCoveragePercent: Double,
+    val adaptiveThreshold: Double,
+    val rejected: Boolean
+)
 
 class Camera2HdrCapture(context: Context) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -217,6 +234,9 @@ class Camera2HdrCapture(context: Context) {
                 jpegEncodingMs = fusionOutput.timings.jpegEncodingMs,
                 motionSuppressionMs = fusionOutput.timings.motionSuppressionMs,
                 motionMaskCoveragePercent = fusionOutput.timings.motionMaskCoveragePercent,
+                motionMaskRawCoveragePercent = fusionOutput.timings.motionMaskRawCoveragePercent,
+                motionMaskThreshold = fusionOutput.timings.motionMaskThreshold,
+                motionMaskRejected = fusionOutput.timings.motionMaskRejected,
                 exposureRatio = null,
                 opencvThreads = Core.getNumThreads(),
                 alignmentMaxBits = HdrFusion.ALIGNMENT_MAX_BITS
@@ -501,7 +521,7 @@ private object HdrFusion {
             fusionMs = SystemClock.elapsedRealtime() - fusionStart
 
             val motionStart = SystemClock.elapsedRealtime()
-            val motionCoverage = suppressMotionGhosts(fusionInputs, fused)
+            val motionResult = suppressMotionGhosts(fusionInputs, fused)
             val motionSuppressionMs = SystemClock.elapsedRealtime() - motionStart
 
             val finishingStart = SystemClock.elapsedRealtime()
@@ -563,7 +583,11 @@ private object HdrFusion {
                     encoded.toArray(),
                     HdrFusionTimings(
                         decodeMs, alignmentMs, fusionMs, finishingMs, jpegEncodingMs,
-                        motionSuppressionMs, motionCoverage
+                        motionSuppressionMs,
+                        motionResult.acceptedCoveragePercent,
+                        motionResult.rawCoveragePercent,
+                        motionResult.adaptiveThreshold,
+                        motionResult.rejected
                     )
                 )
             } finally {
@@ -579,15 +603,16 @@ private object HdrFusion {
     }
 
     /**
-     * Detects pixels that disagree with the middle exposure after compensating
-     * for each frame's average brightness. Moving regions are softly replaced
-     * with the middle exposure; stationary regions retain the HDR fusion.
+     * Detects localized structural differences after average-brightness
+     * normalization and low-pass filtering. A broad or unreliable mask is
+     * rejected rather than allowing motion correction to replace most of HDR.
      */
-    private fun suppressMotionGhosts(images: List<Mat>, fused: Mat): Double {
+    private fun suppressMotionGhosts(images: List<Mat>, fused: Mat): MotionSuppressionResult {
         require(images.size == 3)
         val reference = images[0]
         val referenceGray = Mat()
         val referenceFloat = Mat()
+        val referenceBlurred = Mat()
         val combinedMask = Mat.zeros(reference.rows(), reference.cols(), CvType.CV_8UC1)
         val kernel = Imgproc.getStructuringElement(
             Imgproc.MORPH_ELLIPSE,
@@ -606,13 +631,17 @@ private object HdrFusion {
             Imgproc.cvtColor(reference, referenceGray, Imgproc.COLOR_BGR2GRAY)
             referenceGray.convertTo(referenceFloat, CvType.CV_32FC1)
             val referenceMean = Core.mean(referenceFloat).`val`[0].coerceAtLeast(1.0)
-            val threshold = maxOf(8.0, referenceMean * 0.14)
+            Imgproc.GaussianBlur(referenceFloat, referenceBlurred, CvSize(0.0, 0.0), 1.2)
+            var thresholdSum = 0.0
 
             for (index in 1..2) {
                 val gray = Mat()
                 val normalized = Mat()
+                val blurred = Mat()
                 val difference = Mat()
                 val detected = Mat()
+                val differenceMean = MatOfDouble()
+                val differenceStdDev = MatOfDouble()
                 try {
                     Imgproc.cvtColor(images[index], gray, Imgproc.COLOR_BGR2GRAY)
                     gray.convertTo(normalized, CvType.CV_32FC1)
@@ -620,18 +649,36 @@ private object HdrFusion {
                     if (frameMean > 1.0) {
                         Core.multiply(normalized, Scalar(referenceMean / frameMean), normalized)
                     }
-                    Core.absdiff(referenceFloat, normalized, difference)
-                    Core.compare(difference, Scalar(threshold), detected, Core.CMP_GT)
+                    Imgproc.GaussianBlur(normalized, blurred, CvSize(0.0, 0.0), 1.2)
+                    Core.absdiff(referenceBlurred, blurred, difference)
+                    Core.meanStdDev(difference, differenceMean, differenceStdDev)
+                    val diffMean = differenceMean.toArray().firstOrNull() ?: 0.0
+                    val diffStdDev = differenceStdDev.toArray().firstOrNull() ?: 0.0
+                    // Ignore ordinary residual exposure/texture variation; only
+                    // unusually large local differences become motion candidates.
+                    val adaptiveThreshold = maxOf(12.0, diffMean + 2.0 * diffStdDev)
+                    thresholdSum += adaptiveThreshold
+                    Core.compare(difference, Scalar(adaptiveThreshold), detected, Core.CMP_GT)
                     Core.bitwise_or(combinedMask, detected, combinedMask)
                 } finally {
                     gray.release()
                     normalized.release()
+                    blurred.release()
                     difference.release()
                     detected.release()
+                    differenceMean.release()
+                    differenceStdDev.release()
                 }
             }
 
+            val totalPixels = reference.rows().toDouble() * reference.cols().toDouble()
+            val rawCoverage = Core.countNonZero(combinedMask).toDouble() * 100.0 / totalPixels
             Imgproc.dilate(combinedMask, dilatedMask, kernel)
+            val dilatedCoverage = Core.countNonZero(dilatedMask).toDouble() * 100.0 / totalPixels
+            // Never let a noisy/global mask silently turn the HDR result into
+            // a middle-exposure image. Reject masks covering more than 35%.
+            val rejected = dilatedCoverage > 35.0
+            if (rejected) dilatedMask.setTo(Scalar(0.0))
             dilatedMask.convertTo(maskFloat, CvType.CV_32FC1, 1.0 / 255.0)
             Imgproc.GaussianBlur(maskFloat, softMask, CvSize(0.0, 0.0), 2.0)
             onesMask.create(softMask.size(), CvType.CV_32FC1)
@@ -658,11 +705,17 @@ private object HdrFusion {
             Core.merge(compositeChannels, composite)
             composite.copyTo(fused)
 
-            return Core.countNonZero(dilatedMask).toDouble() * 100.0 /
-                (reference.rows().toDouble() * reference.cols().toDouble())
+            val acceptedCoverage = if (rejected) 0.0 else dilatedCoverage
+            MotionSuppressionResult(
+                rawCoveragePercent = rawCoverage,
+                acceptedCoveragePercent = acceptedCoverage,
+                adaptiveThreshold = thresholdSum / 2.0,
+                rejected = rejected
+            )
         } finally {
             referenceGray.release()
             referenceFloat.release()
+            referenceBlurred.release()
             combinedMask.release()
             kernel.release()
             dilatedMask.release()
