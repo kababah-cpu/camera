@@ -576,6 +576,7 @@ private object HdrFusion {
             fused.release()
             output.release()
         }
+    }
 
     /**
      * Detects pixels that disagree with the middle exposure after compensating
@@ -674,7 +675,5 @@ private object HdrFusion {
             compositeChannels.forEach { it.release() }
             composite.release()
         }
-    }
-
     }
 }
