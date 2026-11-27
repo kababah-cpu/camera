@@ -241,7 +241,8 @@ class Camera2HdrCapture(context: Context) {
         check(completedResults.all { it != null }) {
             "HDR burst completed without metadata for every exposure."
         }
-        val measured = completedResults.mapNotNull { result ->
+        val measured = completedResults.mapNotNull { nullableResult ->
+            val result = nullableResult ?: return@mapNotNull null
             val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return@mapNotNull null
             val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return@mapNotNull null
             exposure.toDouble() * iso.toDouble()
