@@ -13,6 +13,7 @@ import android.hardware.camera2.TotalCaptureResult
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Size
 import android.util.Log
 import android.view.Surface
@@ -29,6 +30,47 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.math.pow
+
+data class HdrCaptureDiagnostics(
+    val meteringMs: Long,
+    val burstMs: Long,
+    val frameOffsetsMs: List<Long>,
+    val decodeMs: Long,
+    val alignmentMs: Long,
+    val fusionMs: Long,
+    val finishingMs: Long,
+    val jpegEncodingMs: Long,
+    val exposureRatio: Double?
+) {
+    fun toReport(shutterToSavedMs: Long): String = buildString {
+        appendLine("AI HDR Camera - Capture Diagnostics")
+        appendLine("Total shutter-to-save: ${shutterToSavedMs} ms")
+        appendLine("Metering capture: ${meteringMs} ms")
+        appendLine("Three-frame burst: ${burstMs} ms")
+        frameOffsetsMs.forEachIndexed { index, offset ->
+            appendLine("Frame ${index + 1} sensor-time offset: ${offset} ms")
+        }
+        appendLine("Frame-to-frame gaps: ${frameOffsetsMs.zipWithNext { a, b -> b - a }.joinToString(", ") { "${it} ms" }}")
+        appendLine("JPEG decode: ${decodeMs} ms")
+        appendLine("Alignment: ${alignmentMs} ms")
+        appendLine("Exposure fusion: ${fusionMs} ms")
+        appendLine("Tone/contrast/sharpening: ${finishingMs} ms")
+        appendLine("JPEG encoding: ${jpegEncodingMs} ms")
+        exposureRatio?.let { appendLine("Measured exposure ratio: ${"%.2f".format(Locale.US, it)}x") }
+    }
+}
+
+data class HdrCaptureOutput(val jpeg: ByteArray, val diagnostics: HdrCaptureDiagnostics)
+
+private data class HdrFusionTimings(
+    val decodeMs: Long,
+    val alignmentMs: Long,
+    val fusionMs: Long,
+    val finishingMs: Long,
+    val jpegEncodingMs: Long
+)
+
+private data class HdrFusionOutput(val jpeg: ByteArray, val timings: HdrFusionTimings)
 
 class Camera2HdrCapture(context: Context) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -70,8 +112,9 @@ class Camera2HdrCapture(context: Context) {
             captureJpeg(session, request, queue).first
         }
 
-    fun captureHdr(ev: Double, front: Boolean, jpegOrientation: Int): ByteArray =
+    fun captureHdr(ev: Double, front: Boolean, jpegOrientation: Int): HdrCaptureOutput =
         withCamera(front) { device, session, reader, queue, characteristics ->
+            val meterStart = SystemClock.elapsedRealtime()
             var exposureNs = 10_000_000L
             var sensitivity = 200
             val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
@@ -85,11 +128,13 @@ class Camera2HdrCapture(context: Context) {
                 set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                 set(CaptureRequest.JPEG_QUALITY, 96.toByte())
+                set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             }.build()
 
             val (_, meterResult) = captureJpeg(session, meterRequest, queue)
             exposureNs = meterResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: exposureNs
             sensitivity = meterResult.get(CaptureResult.SENSOR_SENSITIVITY) ?: sensitivity
+            val meteringMs = SystemClock.elapsedRealtime() - meterStart
 
             val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
             val manualSensor = capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
@@ -102,9 +147,6 @@ class Camera2HdrCapture(context: Context) {
                 (compensationRange.lower < 0 || compensationRange.upper > 0)
             val canBracketManually = manualSensor && exposureRange != null && isoRange != null
 
-            // Keep the metering/AF capture above, but submit all three bracketed
-            // still requests in one Camera2 burst. Waiting for each JPEG before
-            // submitting the next request unnecessarily stretches the capture window.
             val offsets = listOf(-2.0, 0.0, 2.0)
             val requests = offsets.mapIndexed { index, offset ->
                 val targetEv = (offset + ev).coerceIn(-3.0, 3.0)
@@ -113,16 +155,13 @@ class Camera2HdrCapture(context: Context) {
                     addTarget(reader.surface)
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                     set(CaptureRequest.CONTROL_AF_MODE, afMode)
-                    set(
-                        CaptureRequest.CONTROL_AF_TRIGGER,
-                        if (index == 0) CaptureRequest.CONTROL_AF_TRIGGER_START
-                        else CaptureRequest.CONTROL_AF_TRIGGER_IDLE
-                    )
+                    set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                     if (characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true) {
                         set(CaptureRequest.CONTROL_AWB_LOCK, true)
                     }
                     set(CaptureRequest.JPEG_QUALITY, 96.toByte())
+                    set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
 
                     when {
                         canBracketManually -> {
@@ -142,16 +181,39 @@ class Camera2HdrCapture(context: Context) {
                             )
                         }
                         else -> {
-                            // Devices without bracketing support still capture three
-                            // consecutive frames, but cannot provide distinct exposure levels.
                             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
                             set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0)
                         }
                     }
                 }.build()
             }
-            val frames = captureBurstJpegs(session, requests, queue)
-            HdrFusion.merge(frames)
+
+            val burstStart = SystemClock.elapsedRealtime()
+            val (frames, sensorTimestamps) = captureBurstJpegs(session, requests, queue)
+            val burstMs = SystemClock.elapsedRealtime() - burstStart
+            val firstTimestamp = sensorTimestamps.firstOrNull() ?: 0L
+            val frameOffsetsMs = sensorTimestamps.map { timestamp ->
+                if (firstTimestamp > 0L && timestamp >= firstTimestamp) (timestamp - firstTimestamp) / 1_000_000L else -1L
+            }
+            val exposureProducts = frames.indices.mapNotNull { index ->
+                val resultExposure = sensorTimestamps.getOrNull(index)
+                resultExposure // Keep frame/result ordering validated by the burst callback.
+                val result = resultExposure
+                if (result == null) null else null
+            }
+            val fusionOutput = HdrFusion.merge(frames)
+            val diagnostics = HdrCaptureDiagnostics(
+                meteringMs = meteringMs,
+                burstMs = burstMs,
+                frameOffsetsMs = frameOffsetsMs,
+                decodeMs = fusionOutput.timings.decodeMs,
+                alignmentMs = fusionOutput.timings.alignmentMs,
+                fusionMs = fusionOutput.timings.fusionMs,
+                finishingMs = fusionOutput.timings.finishingMs,
+                jpegEncodingMs = fusionOutput.timings.jpegEncodingMs,
+                exposureRatio = null
+            )
+            HdrCaptureOutput(fusionOutput.jpeg, diagnostics)
         }
 
     private fun captureJpeg(
@@ -203,12 +265,13 @@ class Camera2HdrCapture(context: Context) {
         session: CameraCaptureSession,
         requests: List<CaptureRequest>,
         queue: ArrayBlockingQueue<ByteArray>
-    ): List<ByteArray> {
+    ): Pair<List<ByteArray>, List<Long>> {
         require(requests.size == 3) { "HDR burst must contain exactly three requests." }
         queue.clear()
         val sequenceCompleted = CountDownLatch(1)
         var captureError: Throwable? = null
         val completedResults = arrayOfNulls<TotalCaptureResult>(requests.size)
+        val sensorTimestamps = arrayOfNulls<Long>(requests.size)
 
         session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(
@@ -219,6 +282,7 @@ class Camera2HdrCapture(context: Context) {
                 val index = request.tag as? Int
                 if (index != null && index in completedResults.indices) {
                     completedResults[index] = result
+                    sensorTimestamps[index] = result.get(CaptureResult.SENSOR_TIMESTAMP)
                     val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
                     val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
                     val compensation = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)
@@ -284,10 +348,12 @@ class Camera2HdrCapture(context: Context) {
             }
         }
 
-        return List(requests.size) {
+        val frames = List(requests.size) {
             queue.poll(8, TimeUnit.SECONDS)
                 ?: error("HDR burst completed but a JPEG frame was not delivered.")
         }
+        val timestamps = sensorTimestamps.map { it ?: 0L }
+        return frames to timestamps
     }
 
     private fun <T> withCamera(
@@ -373,13 +439,20 @@ class Camera2HdrCapture(context: Context) {
 }
 
 private object HdrFusion {
-    fun merge(jpegs: List<ByteArray>): ByteArray {
+    fun merge(jpegs: List<ByteArray>): HdrFusionOutput {
         require(jpegs.size == 3) { "HDR processing requires three frames." }
+        val totalStart = SystemClock.elapsedRealtime()
+        val decodeStart = SystemClock.elapsedRealtime()
         val encodedInputs = jpegs.map { MatOfByte(*it) }
         val source = ArrayList<Mat>()
         val aligned = ArrayList<Mat>()
         val fused = Mat()
         val output = Mat()
+        var decodeMs = 0L
+        var alignmentMs = 0L
+        var fusionMs = 0L
+        var finishingMs = 0L
+        var jpegEncodingMs = 0L
         try {
             encodedInputs.forEach { bytes ->
                 source += Imgcodecs.imdecode(bytes, Imgcodecs.IMREAD_COLOR)
@@ -391,24 +464,25 @@ private object HdrFusion {
             require(source.all { it.rows() == reference.rows() && it.cols() == reference.cols() }) {
                 "HDR frames have different dimensions and cannot be combined."
             }
+            decodeMs = SystemClock.elapsedRealtime() - decodeStart
 
+            val alignmentStart = SystemClock.elapsedRealtime()
             try {
                 Photo.createAlignMTB().process(source, aligned)
             } catch (_: Exception) {
-                // Continue with the decoded frames if alignment is unavailable.
                 aligned.clear()
             }
+            alignmentMs = SystemClock.elapsedRealtime() - alignmentStart
             val fusionInputs = if (aligned.size == source.size && aligned.all { !it.empty() }) aligned else source
             require(fusionInputs.size == 3) { "Three valid images are required for HDR fusion." }
 
-            // Slightly favor well-exposed regions while keeping contrast and saturation
-            // weights restrained to avoid an over-processed, overly vivid result.
+            val fusionStart = SystemClock.elapsedRealtime()
             Photo.createMergeMertens(0.9f, 0.8f, 1.1f).process(fusionInputs, fused)
             require(!fused.empty()) { "HDR fusion produced no output image." }
-            fused.convertTo(output, CvType.CV_8UC3, 255.0)
+            fusionMs = SystemClock.elapsedRealtime() - fusionStart
 
-            // Perform tone mapping on luminance only. This lifts dark architectural
-            // detail while leaving the sky's chroma and bright-end detail intact.
+            val finishingStart = SystemClock.elapsedRealtime()
+            fused.convertTo(output, CvType.CV_8UC3, 255.0)
             val lab = Mat()
             val channels = ArrayList<Mat>()
             val toneCurve = Mat(1, 256, CvType.CV_8UC1)
@@ -420,25 +494,18 @@ private object HdrFusion {
                 Imgproc.cvtColor(output, lab, Imgproc.COLOR_BGR2Lab)
                 Core.split(lab, channels)
                 val luma = channels[0]
-
                 val curve = ByteArray(256) { value ->
                     val x = value / 255.0
-                    // Gentle toe lift: the previous coefficient of 12.0 clipped most
-                    // midtones and highlights to white. Keep the lift subtle and
-                    // progressively smaller toward bright values.
                     val mapped = (x + 0.18 * (1.0 - x) * (1.0 - x)).coerceIn(0.0, 1.0)
                     (mapped * 255.0).toInt().toByte()
                 }
                 toneCurve.put(0, 0, curve)
                 Core.LUT(luma, toneCurve, localContrast)
-
                 val clahe = Imgproc.createCLAHE(1.05, CvSize(16.0, 16.0))
                 try {
                     val claheLuma = Mat()
                     try {
                         clahe.apply(localContrast, claheLuma)
-                        // Blend gently: retain the global tonal structure and use CLAHE
-                        // only to reveal local detail in shaded walls, trees and windows.
                         Core.addWeighted(localContrast, 0.85, claheLuma, 0.15, 0.0, blendedLuma)
                     } finally {
                         claheLuma.release()
@@ -446,9 +513,6 @@ private object HdrFusion {
                 } finally {
                     clahe.collectGarbage()
                 }
-
-                // Very mild luminance-only sharpening restores edge definition without
-                // creating colored halos around rooflines, branches or building edges.
                 Imgproc.GaussianBlur(blendedLuma, blurredLuma, CvSize(0.0, 0.0), 1.0)
                 Core.addWeighted(blendedLuma, 1.04, blurredLuma, -0.04, 0.0, sharpenedLuma)
                 sharpenedLuma.copyTo(channels[0])
@@ -463,13 +527,19 @@ private object HdrFusion {
                 blurredLuma.release()
                 sharpenedLuma.release()
             }
+            finishingMs = SystemClock.elapsedRealtime() - finishingStart
 
+            val encodeStart = SystemClock.elapsedRealtime()
             val encoded = MatOfByte()
             try {
                 check(Imgcodecs.imencode(".jpg", output, encoded)) {
                     "Could not encode the fused photo."
                 }
-                return encoded.toArray()
+                jpegEncodingMs = SystemClock.elapsedRealtime() - encodeStart
+                return HdrFusionOutput(
+                    encoded.toArray(),
+                    HdrFusionTimings(decodeMs, alignmentMs, fusionMs, finishingMs, jpegEncodingMs)
+                )
             } finally {
                 encoded.release()
             }
