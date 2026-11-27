@@ -10,7 +10,7 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.media.Image
-import android.media.ImageFormat
+import android.graphics.ImageFormat
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
