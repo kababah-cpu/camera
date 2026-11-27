@@ -706,7 +706,7 @@ private object HdrFusion {
             composite.copyTo(fused)
 
             val acceptedCoverage = if (rejected) 0.0 else dilatedCoverage
-            MotionSuppressionResult(
+            return MotionSuppressionResult(
                 rawCoveragePercent = rawCoverage,
                 acceptedCoveragePercent = acceptedCoverage,
                 adaptiveThreshold = thresholdSum / 2.0,
