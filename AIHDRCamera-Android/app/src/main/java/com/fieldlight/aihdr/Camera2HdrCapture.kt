@@ -29,6 +29,7 @@ import org.opencv.photo.Photo
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.Locale
 import kotlin.math.pow
 
 data class HdrCaptureDiagnostics(
@@ -194,12 +195,6 @@ class Camera2HdrCapture(context: Context) {
             val firstTimestamp = sensorTimestamps.firstOrNull() ?: 0L
             val frameOffsetsMs = sensorTimestamps.map { timestamp ->
                 if (firstTimestamp > 0L && timestamp >= firstTimestamp) (timestamp - firstTimestamp) / 1_000_000L else -1L
-            }
-            val exposureProducts = frames.indices.mapNotNull { index ->
-                val resultExposure = sensorTimestamps.getOrNull(index)
-                resultExposure // Keep frame/result ordering validated by the burst callback.
-                val result = resultExposure
-                if (result == null) null else null
             }
             val fusionOutput = HdrFusion.merge(frames)
             val diagnostics = HdrCaptureDiagnostics(
