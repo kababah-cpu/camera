@@ -289,7 +289,14 @@ class Camera2HdrCapture(context: Context) {
                 device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                     setTag(index)
                     addTarget(reader.surface)
-                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                    // In manual-sensor mode, disable the top-level 3A control mode as well
+                    // as AE. Some vendor camera HALs otherwise report AE_OFF but continue
+                    // applying one shared auto-controlled sensor exposure to the burst.
+                    set(
+                        CaptureRequest.CONTROL_MODE,
+                        if (canBracketManually) CaptureRequest.CONTROL_MODE_OFF
+                        else CaptureRequest.CONTROL_MODE_AUTO
+                    )
                     set(CaptureRequest.CONTROL_AF_MODE, afMode)
                     set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
                     set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
