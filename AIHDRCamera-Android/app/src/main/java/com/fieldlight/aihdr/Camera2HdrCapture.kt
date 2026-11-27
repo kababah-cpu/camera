@@ -14,6 +14,7 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
+import android.util.Log
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -84,6 +85,7 @@ class Camera2HdrCapture(context: Context) {
             val requests = offsets.mapIndexed { index, offset ->
                 val targetEv = (offset + ev).coerceIn(-3.0, 3.0)
                 device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    setTag(index)
                     addTarget(reader.surface)
                     set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                     set(CaptureRequest.CONTROL_AF_MODE, afMode)
@@ -182,8 +184,29 @@ class Camera2HdrCapture(context: Context) {
         queue.clear()
         val sequenceCompleted = CountDownLatch(1)
         var captureError: Throwable? = null
+        val completedResults = arrayOfNulls<TotalCaptureResult>(requests.size)
 
         session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult
+            ) {
+                val index = request.tag as? Int
+                if (index != null && index in completedResults.indices) {
+                    completedResults[index] = result
+                    val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                    val compensation = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)
+                    Log.i(
+                        "AIHDR-Bracket",
+                        "Frame $index: exposureNs=$exposure, ISO=$iso, AE compensation=$compensation"
+                    )
+                } else {
+                    Log.w("AIHDR-Bracket", "Capture result did not contain a valid bracket index.")
+                }
+            }
+
             override fun onCaptureFailed(
                 session: CameraCaptureSession,
                 request: CaptureRequest,
@@ -214,6 +237,27 @@ class Camera2HdrCapture(context: Context) {
             "HDR capture burst timed out."
         }
         captureError?.let { throw it }
+
+        check(completedResults.all { it != null }) {
+            "HDR burst completed without metadata for every exposure."
+        }
+        val measured = completedResults.mapNotNull { result ->
+            val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return@mapNotNull null
+            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: return@mapNotNull null
+            exposure.toDouble() * iso.toDouble()
+        }
+        if (measured.size == requests.size) {
+            val minExposure = measured.minOrNull() ?: 0.0
+            val maxExposure = measured.maxOrNull() ?: 0.0
+            val ratio = if (minExposure > 0.0) maxExposure / minExposure else 0.0
+            Log.i("AIHDR-Bracket", "Effective bracket exposure ratio: $ratio")
+            if (ratio < 2.5) {
+                Log.w(
+                    "AIHDR-Bracket",
+                    "Camera applied only a narrow exposure range; HDR recovery may be limited."
+                )
+            }
+        }
 
         return List(requests.size) {
             queue.poll(8, TimeUnit.SECONDS)
