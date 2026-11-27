@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.view.TextureView
+import android.view.Surface
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -180,9 +181,16 @@ fun CameraScreen() {
                                             if (hdrEnabled && !OpenCVLoader.initLocal()) {
                                                 error("OpenCV could not initialize. Standard mode is still available.")
                                             }
-                                            val bytes = if (hdrEnabled) camera.captureHdr(exposureBoost.toDouble(), frontCamera)
-                                                else camera.captureStandard(frontCamera)
-                                            savePhoto(context, bytes)
+                                            @Suppress("DEPRECATION")
+                                            val displayRotation = activity?.windowManager?.defaultDisplay?.rotation
+                                                ?: Surface.ROTATION_0
+                                            val jpegOrientation = camera.jpegOrientation(frontCamera, displayRotation)
+                                            val bytes = if (hdrEnabled) {
+                                                camera.captureHdr(exposureBoost.toDouble(), frontCamera, jpegOrientation)
+                                            } else {
+                                                camera.captureStandard(frontCamera, jpegOrientation)
+                                            }
+                                            savePhoto(context, bytes, jpegOrientation)
                                         } catch (error: Exception) {
                                             Result.failure<Uri>(error)
                                         }
@@ -223,7 +231,7 @@ fun CameraScreen() {
     }
 }
 
-private fun savePhoto(context: android.content.Context, jpeg: ByteArray): Result<Uri> {
+private fun savePhoto(context: android.content.Context, jpeg: ByteArray, orientationDegrees: Int): Result<Uri> {
     return try {
         val resolver = context.contentResolver
         val name = "AIHDR_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
@@ -238,6 +246,21 @@ private fun savePhoto(context: android.content.Context, jpeg: ByteArray): Result
         val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             ?: error("Could not create a gallery photo.")
         resolver.openOutputStream(uri)?.use { it.write(jpeg) } ?: error("Could not write the photo.")
+        val orientation = when (((orientationDegrees % 360) + 360) % 360) {
+            90 -> androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90
+            180 -> androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180
+            270 -> androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270
+            else -> androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL
+        }
+        resolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
+            val exif = androidx.exifinterface.media.ExifInterface(descriptor.fileDescriptor)
+            val timestamp = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date())
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION, orientation.toString())
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME, timestamp)
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL, timestamp)
+            exif.setAttribute(androidx.exifinterface.media.ExifInterface.TAG_SOFTWARE, "AI HDR Camera")
+            exif.saveAttributes()
+        } ?: error("Could not reopen the saved photo to write EXIF metadata.")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val complete = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
             resolver.update(uri, complete, null, null)
