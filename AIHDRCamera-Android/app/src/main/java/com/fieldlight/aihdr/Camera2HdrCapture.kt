@@ -658,7 +658,7 @@ private object HdrFusion {
             Core.merge(compositeChannels, composite)
             composite.copyTo(fused)
 
-            Core.countNonZero(dilatedMask).toDouble() * 100.0 /
+            return Core.countNonZero(dilatedMask).toDouble() * 100.0 /
                 (reference.rows().toDouble() * reference.cols().toDouble())
         } finally {
             referenceGray.release()
