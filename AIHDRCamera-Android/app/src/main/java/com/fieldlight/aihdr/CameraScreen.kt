@@ -7,6 +7,8 @@ import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.TextureView
 import android.view.Surface
@@ -56,6 +58,8 @@ import java.util.Date
 import java.util.Locale
 
 @Composable
+private data class CaptureUiResult(val uri: Uri, val diagnostics: String?)
+
 fun CameraScreen() {
     val context = LocalContext.current
     val activity = context as? android.app.Activity
@@ -68,6 +72,7 @@ fun CameraScreen() {
     var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Ready") }
     var lastPhoto by remember { mutableStateOf<Uri?>(null) }
+    var hdrReport by remember { mutableStateOf<String?>(null) }
     var frontCamera by remember { mutableStateOf(false) }
     var textureView by remember { mutableStateOf<TextureView?>(null) }
     val preview = remember { CameraPreviewController(context) }
@@ -149,6 +154,31 @@ fun CameraScreen() {
                     }
                     Spacer(Modifier.height(18.dp))
                     Text(status, color = Color.White, style = MaterialTheme.typography.bodyMedium)
+                    if (hdrReport != null) {
+                        Spacer(Modifier.height(8.dp))
+                        Surface(color = Color.Black.copy(alpha = 0.62f), shape = RoundedCornerShape(14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("HDR timing report ready", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                                Button(
+                                    onClick = {
+                                        val report = hdrReport ?: return@Button
+                                        scope.launch {
+                                            val saved = withContext(Dispatchers.IO) {
+                                                runCatching { saveHdrReport(context, report) }
+                                            }
+                                            status = if (saved.isSuccess) "HDR report saved in Downloads / AI HDR Camera"
+                                                else saved.exceptionOrNull()?.message ?: "Could not save HDR report"
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFC857), contentColor = Color.Black)
+                                ) { Text("Save report") }
+                            }
+                        }
+                    }
                     Spacer(Modifier.height(18.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -173,8 +203,10 @@ fun CameraScreen() {
                             onClick = {
                                 if (busy) return@Button
                                 busy = true
+                                hdrReport = null
                                 status = if (hdrEnabled) "Capturing exposures…" else "Capturing photo…"
                                 preview.stopPreview()
+                                val shutterStartMs = SystemClock.elapsedRealtime()
                                 scope.launch {
                                     val result = withContext(Dispatchers.IO) {
                                         try {
@@ -185,19 +217,23 @@ fun CameraScreen() {
                                             val displayRotation = activity?.windowManager?.defaultDisplay?.rotation
                                                 ?: Surface.ROTATION_0
                                             val jpegOrientation = camera.jpegOrientation(frontCamera, displayRotation)
-                                            val bytes = if (hdrEnabled) {
-                                                camera.captureHdr(exposureBoost.toDouble(), frontCamera, jpegOrientation)
+                                            if (hdrEnabled) {
+                                                val hdr = camera.captureHdr(exposureBoost.toDouble(), frontCamera, jpegOrientation)
+                                                val uri = savePhoto(context, hdr.jpeg, jpegOrientation)
+                                                val totalMs = SystemClock.elapsedRealtime() - shutterStartMs
+                                                Result.success(CaptureUiResult(uri, hdr.diagnostics.toReport(totalMs)))
                                             } else {
-                                                camera.captureStandard(frontCamera, jpegOrientation)
+                                                val bytes = camera.captureStandard(frontCamera, jpegOrientation)
+                                                Result.success(CaptureUiResult(savePhoto(context, bytes, jpegOrientation), null))
                                             }
-                                            savePhoto(context, bytes, jpegOrientation)
                                         } catch (error: Exception) {
-                                            Result.failure<Uri>(error)
+                                            Result.failure<CaptureUiResult>(error)
                                         }
                                     }
                                     result.fold(
                                         onSuccess = {
-                                            lastPhoto = it
+                                            lastPhoto = it.uri
+                                            hdrReport = it.diagnostics
                                             status = "Photo saved to your gallery"
                                         },
                                         onFailure = {
@@ -268,5 +304,32 @@ private fun savePhoto(context: android.content.Context, jpeg: ByteArray, orienta
         Result.success(uri)
     } catch (error: Exception) {
         Result.failure(error)
+    }
+}
+
+
+private fun saveHdrReport(context: android.content.Context, report: String): Uri {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        error("Saving a shared diagnostics report requires Android 10 or later.")
+    }
+    val resolver = context.contentResolver
+    val name = "AIHDR_Diagnostics_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".txt"
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+        put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AI HDR Camera")
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+        ?: error("Could not create the diagnostics report in Downloads.")
+    try {
+        resolver.openOutputStream(uri)?.use { it.write(report.toByteArray(Charsets.UTF_8)) }
+            ?: error("Could not write the diagnostics report.")
+        val complete = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+        resolver.update(uri, complete, null, null)
+        return uri
+    } catch (error: Exception) {
+        resolver.delete(uri, null, null)
+        throw error
     }
 }
