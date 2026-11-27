@@ -596,6 +596,7 @@ private object HdrFusion {
         val softMask = Mat()
         val maskFloat = Mat()
         val inverseMask = Mat()
+        val onesMask = Mat()
         val referenceChannels = ArrayList<Mat>()
         val fusedChannels = ArrayList<Mat>()
         val compositeChannels = ArrayList<Mat>()
@@ -603,7 +604,7 @@ private object HdrFusion {
         try {
             Imgproc.cvtColor(reference, referenceGray, Imgproc.COLOR_BGR2GRAY)
             referenceGray.convertTo(referenceFloat, CvType.CV_32FC1)
-            val referenceMean = Core.mean(referenceFloat).\`val\`[0].coerceAtLeast(1.0)
+            val referenceMean = Core.mean(referenceFloat).`val`[0].coerceAtLeast(1.0)
             val threshold = maxOf(8.0, referenceMean * 0.14)
 
             for (index in 1..2) {
@@ -614,7 +615,7 @@ private object HdrFusion {
                 try {
                     Imgproc.cvtColor(images[index], gray, Imgproc.COLOR_BGR2GRAY)
                     gray.convertTo(normalized, CvType.CV_32FC1)
-                    val frameMean = Core.mean(normalized).\`val\`[0]
+                    val frameMean = Core.mean(normalized).`val`[0]
                     if (frameMean > 1.0) {
                         Core.multiply(normalized, Scalar(referenceMean / frameMean), normalized)
                     }
@@ -632,11 +633,9 @@ private object HdrFusion {
             Imgproc.dilate(combinedMask, dilatedMask, kernel)
             dilatedMask.convertTo(maskFloat, CvType.CV_32FC1, 1.0 / 255.0)
             Imgproc.GaussianBlur(maskFloat, softMask, CvSize(0.0, 0.0), 2.0)
-            Core.subtract(
-                Mat.ones(softMask.size(), CvType.CV_32FC1),
-                softMask,
-                inverseMask
-            )
+            onesMask.create(softMask.size(), CvType.CV_32FC1)
+            onesMask.setTo(Scalar(1.0))
+            Core.subtract(onesMask, softMask, inverseMask)
 
             reference.convertTo(composite, CvType.CV_32FC3, 1.0 / 255.0)
             Core.split(composite, referenceChannels)
@@ -669,6 +668,7 @@ private object HdrFusion {
             softMask.release()
             maskFloat.release()
             inverseMask.release()
+            onesMask.release()
             referenceChannels.forEach { it.release() }
             fusedChannels.forEach { it.release() }
             compositeChannels.forEach { it.release() }
