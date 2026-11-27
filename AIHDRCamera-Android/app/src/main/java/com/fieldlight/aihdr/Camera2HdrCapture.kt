@@ -773,7 +773,7 @@ private object HdrFusion {
             composite.copyTo(fused)
 
             val acceptedCoverage = if (rejected) 0.0 else dilatedCoverage
-            val middleContribution = if (rejected) 0.0 else Core.mean(softMask).get(0, 0)[0] * 100.0
+            val middleContribution = if (rejected) 0.0 else Core.mean(softMask).`val`[0] * 100.0
             return MotionSuppressionResult(
                 rawCoveragePercent = rawCoverage,
                 acceptedCoveragePercent = acceptedCoverage,
