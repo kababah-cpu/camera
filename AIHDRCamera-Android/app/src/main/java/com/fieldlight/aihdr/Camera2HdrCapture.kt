@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
 import android.util.Log
+import android.view.Surface
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
@@ -34,7 +35,28 @@ class Camera2HdrCapture(context: Context) {
     private val thread = HandlerThread("Camera2Capture").apply { start() }
     private val handler = Handler(thread.looper)
 
-    fun captureStandard(front: Boolean): ByteArray =
+    fun jpegOrientation(front: Boolean, displayRotation: Int): Int {
+        val cameraId = manager.cameraIdList.firstOrNull { id ->
+            val facing = manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)
+            facing == if (front) CameraCharacteristics.LENS_FACING_FRONT
+            else CameraCharacteristics.LENS_FACING_BACK
+        } ?: manager.cameraIdList.firstOrNull() ?: error("No camera is available.")
+        val sensorOrientation = manager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val deviceDegrees = when (displayRotation) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        return if (front) {
+            (sensorOrientation + deviceDegrees) % 360
+        } else {
+            (sensorOrientation - deviceDegrees + 360) % 360
+        }
+    }
+
+    fun captureStandard(front: Boolean, jpegOrientation: Int): ByteArray =
         withCamera(front) { device, session, reader, queue, _ ->
             val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
@@ -42,11 +64,13 @@ class Camera2HdrCapture(context: Context) {
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                 set(CaptureRequest.JPEG_QUALITY, 96.toByte())
+                    set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+                set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             }.build()
             captureJpeg(session, request, queue).first
         }
 
-    fun captureHdr(ev: Double, front: Boolean): ByteArray =
+    fun captureHdr(ev: Double, front: Boolean, jpegOrientation: Int): ByteArray =
         withCamera(front) { device, session, reader, queue, characteristics ->
             var exposureNs = 10_000_000L
             var sensitivity = 200
