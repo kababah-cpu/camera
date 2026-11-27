@@ -749,7 +749,7 @@ private object HdrFusion {
         try {
             Imgproc.cvtColor(reference, referenceGray, Imgproc.COLOR_BGR2GRAY)
             referenceGray.convertTo(referenceFloat, CvType.CV_32FC1)
-            val referenceMean = Core.mean(referenceFloat).\`val\`[0].coerceAtLeast(1.0)
+            val referenceMean = Core.mean(referenceFloat).`val`[0].coerceAtLeast(1.0)
             val threshold = maxOf(8.0, referenceMean * 0.14)
 
             for (index in 1..2) {
@@ -760,7 +760,7 @@ private object HdrFusion {
                 try {
                     Imgproc.cvtColor(images[index], gray, Imgproc.COLOR_BGR2GRAY)
                     gray.convertTo(normalized, CvType.CV_32FC1)
-                    val frameMean = Core.mean(normalized).\`val\`[0]
+                    val frameMean = Core.mean(normalized).`val`[0]
                     if (frameMean > 1.0) {
                         Core.multiply(normalized, Scalar(referenceMean / frameMean), normalized)
                     }
@@ -808,7 +808,7 @@ private object HdrFusion {
             Core.merge(compositeChannels, composite)
             composite.copyTo(fused)
 
-            val middleContribution = Core.mean(softMask).\`val\`[0] * 100.0
+            val middleContribution = Core.mean(softMask).`val`[0] * 100.0
             return MotionSuppressionResult(
                 rawCoveragePercent = rawCoverage,
                 acceptedCoveragePercent = acceptedCoverage,
