@@ -101,13 +101,13 @@ class AdaptiveSceneMeter {
         val globalEv = ln(112.0 / max(24.0, median.toDouble())) / ln(2.0)
         val backlightDifference = (borderMean - centerMean) / 100.0
         val highlightPenalty = when {
-            p95 >= 252 && clippedPercent > 4.0 -> 0.55
-            p95 >= 245 && clippedPercent > 1.5 -> 0.32
-            p95 >= 235 -> 0.16
+            p95 >= 252 && clippedPercent > 4.0 -> 0.30
+            p95 >= 245 && clippedPercent > 1.5 -> 0.18
+            p95 >= 235 -> 0.08
             else -> 0.0
         }
         val subjectBias = (backlightDifference * 0.18).coerceIn(-0.18, 0.32)
-        val targetEv = (0.72 * centerEv + 0.28 * globalEv + subjectBias - highlightPenalty)
+        val targetEv = (0.82 * centerEv + 0.18 * globalEv + subjectBias - highlightPenalty)
             .coerceIn(-1.3, 1.3)
 
         return SceneLuminance(
