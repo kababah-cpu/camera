@@ -37,6 +37,10 @@ data class HdrCaptureDiagnostics(
     val meteringMs: Long,
     val burstMs: Long,
     val frameOffsetsMs: List<Long>,
+    val frameExposureMs: List<Double>,
+    val frameDurationMs: List<Double>,
+    val frameSensitivityIso: List<Int>,
+    val minimumJpegFrameDurationMs: Double,
     val decodeMs: Long,
     val alignmentMs: Long,
     val fusionMs: Long,
@@ -60,6 +64,10 @@ data class HdrCaptureDiagnostics(
             appendLine("Frame ${index + 1} sensor-time offset: ${offset} ms")
         }
         appendLine("Frame-to-frame gaps: ${frameOffsetsMs.zipWithNext { a, b -> b - a }.joinToString(", ") { "${it} ms" }}")
+        appendLine("Sensor exposure durations: ${frameExposureMs.joinToString(", ") { "%.2f".format(Locale.US, it) + " ms" }}")
+        appendLine("Sensor frame durations: ${frameDurationMs.joinToString(", ") { "%.2f".format(Locale.US, it) + " ms" }}")
+        appendLine("Sensor ISO values: ${frameSensitivityIso.joinToString(", ")}")
+        appendLine("Minimum JPEG frame duration: ${"%.2f".format(Locale.US, minimumJpegFrameDurationMs)} ms")
         appendLine("JPEG decode: ${decodeMs} ms")
         appendLine("Alignment: ${alignmentMs} ms")
         appendLine("Exposure fusion: ${fusionMs} ms")
@@ -77,6 +85,8 @@ data class HdrCaptureDiagnostics(
 }
 
 data class HdrCaptureOutput(val jpeg: ByteArray, val diagnostics: HdrCaptureDiagnostics)
+
+private data class CapturedFrameTiming(val exposureNs: Long, val frameDurationNs: Long, val sensitivityIso: Int)
 
 private data class HdrFusionTimings(
     val decodeMs: Long,
@@ -163,6 +173,12 @@ class Camera2HdrCapture(context: Context) {
             sensitivity = meterResult.get(CaptureResult.SENSOR_SENSITIVITY) ?: sensitivity
             val meteringMs = SystemClock.elapsedRealtime() - meterStart
 
+            val streamMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val jpegSize = streamMap?.getOutputSizes(ImageFormat.JPEG).orEmpty()
+                .filter { it.width.toLong() * it.height <= 12_000_000L }
+                .maxByOrNull { it.width.toLong() * it.height }
+            val minimumJpegFrameDurationNs = if (jpegSize != null)
+                streamMap?.getOutputMinFrameDuration(ImageFormat.JPEG, jpegSize) ?: 0L else 0L
             val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
             val manualSensor = capabilities.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
             val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
@@ -197,6 +213,10 @@ class Camera2HdrCapture(context: Context) {
                                 .coerceIn(exposureRange!!.lower, exposureRange.upper)
                             set(CaptureRequest.SENSOR_EXPOSURE_TIME, adjustedExposure)
                             set(CaptureRequest.SENSOR_SENSITIVITY, sensitivity.coerceIn(isoRange!!.lower, isoRange.upper))
+                            // Request the fastest supported JPEG cadence without shortening exposure.
+                            if (minimumJpegFrameDurationNs > 0L) {
+                                set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(minimumJpegFrameDurationNs, adjustedExposure))
+                            }
                         }
                         canBracketWithAe -> {
                             set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -216,7 +236,7 @@ class Camera2HdrCapture(context: Context) {
             }
 
             val burstStart = SystemClock.elapsedRealtime()
-            val (frames, sensorTimestamps) = captureBurstJpegs(session, requests, queue)
+            val (frames, sensorTimestamps, frameTimings) = captureBurstJpegs(session, requests, queue)
             val burstMs = SystemClock.elapsedRealtime() - burstStart
             val firstTimestamp = sensorTimestamps.firstOrNull() ?: 0L
             val frameOffsetsMs = sensorTimestamps.map { timestamp ->
@@ -227,6 +247,10 @@ class Camera2HdrCapture(context: Context) {
                 meteringMs = meteringMs,
                 burstMs = burstMs,
                 frameOffsetsMs = frameOffsetsMs,
+                frameExposureMs = frameTimings.map { it.exposureNs / 1_000_000.0 },
+                frameDurationMs = frameTimings.map { it.frameDurationNs / 1_000_000.0 },
+                frameSensitivityIso = frameTimings.map { it.sensitivityIso },
+                minimumJpegFrameDurationMs = minimumJpegFrameDurationNs / 1_000_000.0,
                 decodeMs = fusionOutput.timings.decodeMs,
                 alignmentMs = fusionOutput.timings.alignmentMs,
                 fusionMs = fusionOutput.timings.fusionMs,
@@ -293,13 +317,14 @@ class Camera2HdrCapture(context: Context) {
         session: CameraCaptureSession,
         requests: List<CaptureRequest>,
         queue: ArrayBlockingQueue<ByteArray>
-    ): Pair<List<ByteArray>, List<Long>> {
+    ): Triple<List<ByteArray>, List<Long>, List<CapturedFrameTiming>> {
         require(requests.size == 3) { "HDR burst must contain exactly three requests." }
         queue.clear()
         val sequenceCompleted = CountDownLatch(1)
         var captureError: Throwable? = null
         val completedResults = arrayOfNulls<TotalCaptureResult>(requests.size)
         val sensorTimestamps = arrayOfNulls<Long>(requests.size)
+        val frameTimings = arrayOfNulls<CapturedFrameTiming>(requests.size)
 
         session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(
@@ -311,8 +336,10 @@ class Camera2HdrCapture(context: Context) {
                 if (index != null && index in completedResults.indices) {
                     completedResults[index] = result
                     sensorTimestamps[index] = result.get(CaptureResult.SENSOR_TIMESTAMP)
-                    val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                    val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+                    val frameDuration = result.get(CaptureResult.SENSOR_FRAME_DURATION) ?: 0L
+                    val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+                    frameTimings[index] = CapturedFrameTiming(exposure, frameDuration, iso)
                     val compensation = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION)
                     Log.i(
                         "AIHDR-Bracket",
@@ -381,7 +408,8 @@ class Camera2HdrCapture(context: Context) {
                 ?: error("HDR burst completed but a JPEG frame was not delivered.")
         }
         val timestamps = sensorTimestamps.map { it ?: 0L }
-        return frames to timestamps
+        val timings = frameTimings.map { it ?: CapturedFrameTiming(0L, 0L, 0) }
+        return Triple(frames, timestamps, timings)
     }
 
     private fun <T> withCamera(
@@ -616,7 +644,7 @@ private object HdrFusion {
         val combinedMask = Mat.zeros(reference.rows(), reference.cols(), CvType.CV_8UC1)
         val kernel = Imgproc.getStructuringElement(
             Imgproc.MORPH_ELLIPSE,
-            CvSize(7.0, 7.0)
+            CvSize(3.0, 3.0)
         )
         val dilatedMask = Mat()
         val softMask = Mat()
@@ -656,7 +684,7 @@ private object HdrFusion {
                     val diffStdDev = differenceStdDev.toArray().firstOrNull() ?: 0.0
                     // Ignore ordinary residual exposure/texture variation; only
                     // unusually large local differences become motion candidates.
-                    val adaptiveThreshold = maxOf(12.0, diffMean + 2.0 * diffStdDev)
+                    val adaptiveThreshold = maxOf(8.0, diffMean + 1.5 * diffStdDev)
                     thresholdSum += adaptiveThreshold
                     Core.compare(difference, Scalar(adaptiveThreshold), detected, Core.CMP_GT)
                     Core.bitwise_or(combinedMask, detected, combinedMask)
@@ -680,7 +708,7 @@ private object HdrFusion {
             val rejected = dilatedCoverage > 35.0
             if (rejected) dilatedMask.setTo(Scalar(0.0))
             dilatedMask.convertTo(maskFloat, CvType.CV_32FC1, 1.0 / 255.0)
-            Imgproc.GaussianBlur(maskFloat, softMask, CvSize(0.0, 0.0), 2.0)
+            Imgproc.GaussianBlur(maskFloat, softMask, CvSize(0.0, 0.0), 0.9)
             onesMask.create(softMask.size(), CvType.CV_32FC1)
             onesMask.setTo(Scalar(1.0))
             Core.subtract(onesMask, softMask, inverseMask)
