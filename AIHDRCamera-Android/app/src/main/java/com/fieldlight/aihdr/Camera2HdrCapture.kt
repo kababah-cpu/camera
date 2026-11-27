@@ -141,18 +141,34 @@ class Camera2HdrCapture(context: Context) {
         }
     }
 
-    fun captureStandard(front: Boolean, jpegOrientation: Int): ByteArray =
-        withCamera(front) { device, session, reader, queue, _ ->
-            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(reader.surface)
-                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
-                set(CaptureRequest.JPEG_QUALITY, 96.toByte())
-                set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
-            }.build()
-            captureJpeg(session, request, queue).first
-        }
+    fun captureStandard(
+        front: Boolean,
+        jpegOrientation: Int,
+        exposureCompensation: Int = 0
+    ): ByteArray = withCamera(front) { device, session, reader, queue, characteristics ->
+        val compensationRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        val supportedToneModes = characteristics.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)
+            ?: intArrayOf()
+        val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+            addTarget(reader.surface)
+            set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            if (compensationRange != null) {
+                set(
+                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                    exposureCompensation.coerceIn(compensationRange.lower, compensationRange.upper)
+                )
+            }
+            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+            if (supportedToneModes.contains(CaptureRequest.TONEMAP_MODE_HIGH_QUALITY)) {
+                set(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_HIGH_QUALITY)
+            }
+            set(CaptureRequest.JPEG_QUALITY, 96.toByte())
+            set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+        }.build()
+        captureJpeg(session, request, queue).first
+    }
 
     fun captureHdr(ev: Double, front: Boolean, jpegOrientation: Int): HdrCaptureOutput =
         withCamera(front) { device, session, reader, queue, characteristics ->
