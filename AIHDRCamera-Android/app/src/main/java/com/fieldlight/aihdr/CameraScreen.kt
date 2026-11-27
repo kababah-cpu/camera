@@ -152,13 +152,13 @@ fun CameraScreen() {
                                     exposureBoost = it
                                     preview.setExposureBias(it)
                                 },
-                                valueRange = -1f..1.5f,
+                                valueRange = -1f..2f,
                                 enabled = !busy
                             )
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                 Text("−1 EV", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelSmall)
                                 Text(String.format(Locale.US, "%+.1f EV", exposureBoost), color = Color.White, style = MaterialTheme.typography.labelMedium)
-                                Text("+1.5 EV", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelSmall)
+                                Text("+2 EV", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelSmall)
                             }
                         }
                     }
