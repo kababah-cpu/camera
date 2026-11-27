@@ -87,6 +87,7 @@ data class HdrCaptureDiagnostics(
 data class HdrCaptureOutput(val jpeg: ByteArray, val diagnostics: HdrCaptureDiagnostics)
 
 private data class CapturedFrameTiming(val exposureNs: Long, val frameDurationNs: Long, val sensitivityIso: Int)
+private data class CapturedJpeg(val sensorTimestampNs: Long, val bytes: ByteArray)
 
 private data class HdrFusionTimings(
     val decodeMs: Long,
@@ -271,7 +272,7 @@ class Camera2HdrCapture(context: Context) {
     private fun captureJpeg(
         session: CameraCaptureSession,
         request: CaptureRequest,
-        queue: ArrayBlockingQueue<ByteArray>
+        queue: ArrayBlockingQueue<CapturedJpeg>
     ): Pair<ByteArray, TotalCaptureResult> {
         // Remove any image left by a previous request before starting this one.
         queue.clear()
@@ -308,15 +309,35 @@ class Camera2HdrCapture(context: Context) {
 
         check(completed.await(8, TimeUnit.SECONDS)) { "Camera capture callback timed out." }
         captureError?.let { throw it }
-        val jpeg = queue.poll(8, TimeUnit.SECONDS)
-            ?: error("Camera completed the capture but did not deliver a JPEG image.")
-        return jpeg to (captureResult ?: error("Camera returned no capture metadata."))
+        val result = captureResult ?: error("Camera returned no capture metadata.")
+        val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+            ?: error("Camera returned no sensor timestamp for the JPEG.")
+        val jpeg = pollJpegForTimestamp(queue, timestamp, 8)
+            ?: error("Camera completed the capture but did not deliver the matching JPEG image.")
+        return jpeg.bytes to result
+    }
+
+
+    private fun pollJpegForTimestamp(queue: ArrayBlockingQueue<CapturedJpeg>, timestampNs: Long, timeoutSeconds: Long): CapturedJpeg? {
+        val deadline = SystemClock.elapsedRealtime() + timeoutSeconds * 1000L
+        val unmatched = ArrayList<CapturedJpeg>()
+        try {
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val remaining = deadline - SystemClock.elapsedRealtime()
+                val image = queue.poll(remaining, TimeUnit.MILLISECONDS) ?: return null
+                if (image.sensorTimestampNs == timestampNs) return image
+                unmatched += image
+            }
+            return null
+        } finally {
+            unmatched.forEach { queue.offer(it) }
+        }
     }
 
     private fun captureBurstJpegs(
         session: CameraCaptureSession,
         requests: List<CaptureRequest>,
-        queue: ArrayBlockingQueue<ByteArray>
+        queue: ArrayBlockingQueue<CapturedJpeg>
     ): Triple<List<ByteArray>, List<Long>, List<CapturedFrameTiming>> {
         require(requests.size == 3) { "HDR burst must contain exactly three requests." }
         queue.clear()
@@ -403,18 +424,27 @@ class Camera2HdrCapture(context: Context) {
             }
         }
 
-        val frames = List(requests.size) {
-            queue.poll(8, TimeUnit.SECONDS)
-                ?: error("HDR burst completed but a JPEG frame was not delivered.")
+        val resultsByIndex = completedResults.map { it ?: error("Missing HDR capture result.") }
+        val images = ArrayList<CapturedJpeg>(requests.size)
+        repeat(requests.size) {
+            images += queue.poll(8, TimeUnit.SECONDS)
+                ?: error("HDR capture burst completed but a JPEG frame was not delivered.")
         }
-        val timestamps = sensorTimestamps.map { it ?: 0L }
+        val imagesByTimestamp = images.associateBy { it.sensorTimestampNs }
+        val frames = resultsByIndex.mapIndexed { index, result ->
+            val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                ?: error("HDR frame ${index + 1} has no sensor timestamp.")
+            (imagesByTimestamp[timestamp]
+                ?: error("HDR JPEG/result timestamp mismatch for frame ${index + 1}.")).bytes
+        }
+        val timestamps = resultsByIndex.map { it.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L }
         val timings = frameTimings.map { it ?: CapturedFrameTiming(0L, 0L, 0) }
         return Triple(frames, timestamps, timings)
     }
 
     private fun <T> withCamera(
         front: Boolean,
-        block: (CameraDevice, CameraCaptureSession, ImageReader, ArrayBlockingQueue<ByteArray>, CameraCharacteristics) -> T
+        block: (CameraDevice, CameraCaptureSession, ImageReader, ArrayBlockingQueue<CapturedJpeg>, CameraCharacteristics) -> T
     ): T {
         val cameraId = manager.cameraIdList.firstOrNull { id ->
             val facing = manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)
@@ -428,14 +458,14 @@ class Camera2HdrCapture(context: Context) {
             .maxByOrNull { it.width.toLong() * it.height } ?: Size(1920, 1080)
 
         val reader = ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 4)
-        val queue = ArrayBlockingQueue<ByteArray>(4)
+        val queue = ArrayBlockingQueue<CapturedJpeg>(4)
         reader.setOnImageAvailableListener({ source ->
             try {
                 source.acquireNextImage()?.use { image ->
                     val buffer = image.planes[0].buffer
                     val bytes = ByteArray(buffer.remaining())
                     buffer.get(bytes)
-                    queue.offer(bytes)
+                    queue.offer(CapturedJpeg(image.timestamp, bytes))
                 }
             } catch (_: Exception) { }
         }, handler)
