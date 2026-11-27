@@ -34,24 +34,21 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Configure persistent release signing
-        id: signing
+      - name: Verify persistent signing secrets
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
-            echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/aihdr-release.jks"
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Signing secrets are not configured; building a temporary debug APK."
-          fi
+          test -n "$KEYSTORE_BASE64" || (echo "Missing ANDROID_KEYSTORE_BASE64" && exit 1)
+          test -n "$KEYSTORE_PASSWORD" || (echo "Missing ANDROID_KEYSTORE_PASSWORD" && exit 1)
+          test -n "$KEY_ALIAS" || (echo "Missing ANDROID_KEY_ALIAS" && exit 1)
+          test -n "$KEY_PASSWORD" || (echo "Missing ANDROID_KEY_PASSWORD" && exit 1)
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/aihdr-release.jks"
+          test -s "$RUNNER_TEMP/aihdr-release.jks"
 
       - name: Build signed release APK
-        if: steps.signing.outputs.enabled == 'true'
         working-directory: AIHDRCamera-Android
         env:
           ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/aihdr-release.jks
@@ -60,21 +57,8 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: gradle --no-daemon :app:assembleRelease
 
-      - name: Build temporary debug APK
-        if: steps.signing.outputs.enabled != 'true'
-        working-directory: AIHDRCamera-Android
-        run: gradle --no-daemon :app:assembleDebug
-
       - name: Upload signed release APK
-        if: steps.signing.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: AIHDRCamera-Signed-APK
           path: AIHDRCamera-Android/app/build/outputs/apk/release/app-release.apk
-
-      - name: Upload temporary debug APK
-        if: steps.signing.outputs.enabled != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: AIHDRCamera-Debug-APK
-          path: AIHDRCamera-Android/app/build/outputs/apk/debug/app-debug.apk
