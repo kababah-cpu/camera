@@ -38,6 +38,8 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
     @Volatile private var frontFacing = false
     @Volatile private var currentCompensation = 0
     @Volatile private var exposureBiasEv = 0.0
+    @Volatile private var lastSceneTargetEv = 0.0
+    @Volatile private var activePreviewSize: Size? = null
     @Volatile private var aeLower = 0
     @Volatile private var aeUpper = 0
     @Volatile private var aeStepEv = 0.0
@@ -61,7 +63,7 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
 
     fun setExposureBias(ev: Float) {
         exposureBiasEv = ev.toDouble().coerceIn(-1.5, 1.5)
-        handler.post { applyMetering(lastSummary, force = true) }
+        handler.post { applyMetering(lastSummary, lastSceneTargetEv + exposureBiasEv, force = true) }
     }
 
     fun currentExposureCompensation(): Int = currentCompensation
@@ -88,6 +90,7 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
                 .maxByOrNull { it.width.toLong() * it.height }
                 ?: map?.getOutputSizes(SurfaceTexture::class.java)?.maxByOrNull { it.width.toLong() * it.height }
                 ?: Size(1280, 720)
+            activePreviewSize = previewSize
             texture.setDefaultBufferSize(previewSize.width, previewSize.height)
             val surface = Surface(texture)
             previewSurface = surface
@@ -124,6 +127,7 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
                     if (image != null) {
                         val scene = meter.analyze(image)
                         val summary = scene.summary()
+                        lastSceneTargetEv = scene.targetEv
                         val targetEv = scene.targetEv + exposureBiasEv
                         handler.post { applyMetering(summary, targetEv, force = false) }
                     }
@@ -278,6 +282,7 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
         session = null
         device = null
         previewSurface = null
+        activePreviewSize = null
         imageReader = null
         previewBuilder = null
         processing.set(false)
@@ -294,7 +299,7 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
             }
             manager.getCameraCharacteristics(id).get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         }.getOrDefault(0)
-        configurePreviewTransform(orientation, Size(1280, 720))
+        configurePreviewTransform(orientation, activePreviewSize ?: Size(1280, 720))
     }
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
         stopPreview()
