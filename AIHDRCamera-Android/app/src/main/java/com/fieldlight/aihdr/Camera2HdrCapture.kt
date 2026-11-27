@@ -41,6 +41,8 @@ data class HdrCaptureDiagnostics(
     val fusionMs: Long,
     val finishingMs: Long,
     val jpegEncodingMs: Long,
+    val motionSuppressionMs: Long,
+    val motionMaskCoveragePercent: Double,
     val exposureRatio: Double?,
     val opencvThreads: Int,
     val alignmentMaxBits: Int
@@ -59,6 +61,8 @@ data class HdrCaptureDiagnostics(
         appendLine("Exposure fusion: ${fusionMs} ms")
         appendLine("Tone/contrast/sharpening: ${finishingMs} ms")
         appendLine("JPEG encoding: ${jpegEncodingMs} ms")
+        appendLine("Motion ghost suppression: ${motionSuppressionMs} ms")
+        appendLine("Motion mask coverage: ${"%.1f".format(Locale.US, motionMaskCoveragePercent)}%")
         appendLine("OpenCV processing threads: ${opencvThreads}")
         appendLine("Alignment pyramid max bits: ${alignmentMaxBits}")
         exposureRatio?.let { appendLine("Measured exposure ratio: ${"%.2f".format(Locale.US, it)}x") }
@@ -72,7 +76,9 @@ private data class HdrFusionTimings(
     val alignmentMs: Long,
     val fusionMs: Long,
     val finishingMs: Long,
-    val jpegEncodingMs: Long
+    val jpegEncodingMs: Long,
+    val motionSuppressionMs: Long,
+    val motionMaskCoveragePercent: Double
 )
 
 private data class HdrFusionOutput(val jpeg: ByteArray, val timings: HdrFusionTimings)
@@ -111,7 +117,6 @@ class Camera2HdrCapture(context: Context) {
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                 set(CaptureRequest.JPEG_QUALITY, 96.toByte())
-                    set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
                 set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             }.build()
             captureJpeg(session, request, queue).first
@@ -210,6 +215,8 @@ class Camera2HdrCapture(context: Context) {
                 fusionMs = fusionOutput.timings.fusionMs,
                 finishingMs = fusionOutput.timings.finishingMs,
                 jpegEncodingMs = fusionOutput.timings.jpegEncodingMs,
+                motionSuppressionMs = fusionOutput.timings.motionSuppressionMs,
+                motionMaskCoveragePercent = fusionOutput.timings.motionMaskCoveragePercent,
                 exposureRatio = null,
                 opencvThreads = Core.getNumThreads(),
                 alignmentMaxBits = HdrFusion.ALIGNMENT_MAX_BITS
@@ -472,22 +479,30 @@ private object HdrFusion {
             }
             decodeMs = SystemClock.elapsedRealtime() - decodeStart
 
+            // Use the middle exposure as the alignment reference. This reduces
+            // the chance that moving subjects are anchored to the darkest frame.
+            val alignmentSource = listOf(source[1], source[0], source[2])
             val alignmentStart = SystemClock.elapsedRealtime()
             try {
                 val aligner = Photo.createAlignMTB()
                 aligner.setMaxBits(ALIGNMENT_MAX_BITS)
-                aligner.process(source, aligned)
+                aligner.process(alignmentSource, aligned)
             } catch (_: Exception) {
                 aligned.clear()
             }
             alignmentMs = SystemClock.elapsedRealtime() - alignmentStart
-            val fusionInputs = if (aligned.size == source.size && aligned.all { !it.empty() }) aligned else source
+            val fusionInputs = if (aligned.size == alignmentSource.size && aligned.all { !it.empty() })
+                aligned else alignmentSource
             require(fusionInputs.size == 3) { "Three valid images are required for HDR fusion." }
 
             val fusionStart = SystemClock.elapsedRealtime()
             Photo.createMergeMertens(0.9f, 0.8f, 1.1f).process(fusionInputs, fused)
             require(!fused.empty()) { "HDR fusion produced no output image." }
             fusionMs = SystemClock.elapsedRealtime() - fusionStart
+
+            val motionStart = SystemClock.elapsedRealtime()
+            val motionCoverage = suppressMotionGhosts(fusionInputs, fused)
+            val motionSuppressionMs = SystemClock.elapsedRealtime() - motionStart
 
             val finishingStart = SystemClock.elapsedRealtime()
             fused.convertTo(output, CvType.CV_8UC3, 255.0)
@@ -546,7 +561,10 @@ private object HdrFusion {
                 jpegEncodingMs = SystemClock.elapsedRealtime() - encodeStart
                 return HdrFusionOutput(
                     encoded.toArray(),
-                    HdrFusionTimings(decodeMs, alignmentMs, fusionMs, finishingMs, jpegEncodingMs)
+                    HdrFusionTimings(
+                        decodeMs, alignmentMs, fusionMs, finishingMs, jpegEncodingMs,
+                        motionSuppressionMs, motionCoverage
+                    )
                 )
             } finally {
                 encoded.release()
@@ -558,5 +576,105 @@ private object HdrFusion {
             fused.release()
             output.release()
         }
+
+    /**
+     * Detects pixels that disagree with the middle exposure after compensating
+     * for each frame's average brightness. Moving regions are softly replaced
+     * with the middle exposure; stationary regions retain the HDR fusion.
+     */
+    private fun suppressMotionGhosts(images: List<Mat>, fused: Mat): Double {
+        require(images.size == 3)
+        val reference = images[0]
+        val referenceGray = Mat()
+        val referenceFloat = Mat()
+        val combinedMask = Mat.zeros(reference.rows(), reference.cols(), CvType.CV_8UC1)
+        val kernel = Imgproc.getStructuringElement(
+            Imgproc.MORPH_ELLIPSE,
+            CvSize(7.0, 7.0)
+        )
+        val dilatedMask = Mat()
+        val softMask = Mat()
+        val maskFloat = Mat()
+        val inverseMask = Mat()
+        val referenceChannels = ArrayList<Mat>()
+        val fusedChannels = ArrayList<Mat>()
+        val compositeChannels = ArrayList<Mat>()
+        val composite = Mat()
+        try {
+            Imgproc.cvtColor(reference, referenceGray, Imgproc.COLOR_BGR2GRAY)
+            referenceGray.convertTo(referenceFloat, CvType.CV_32FC1)
+            val referenceMean = Core.mean(referenceFloat).\`val\`[0].coerceAtLeast(1.0)
+            val threshold = maxOf(8.0, referenceMean * 0.14)
+
+            for (index in 1..2) {
+                val gray = Mat()
+                val normalized = Mat()
+                val difference = Mat()
+                val detected = Mat()
+                try {
+                    Imgproc.cvtColor(images[index], gray, Imgproc.COLOR_BGR2GRAY)
+                    gray.convertTo(normalized, CvType.CV_32FC1)
+                    val frameMean = Core.mean(normalized).\`val\`[0]
+                    if (frameMean > 1.0) {
+                        Core.multiply(normalized, Scalar(referenceMean / frameMean), normalized)
+                    }
+                    Core.absdiff(referenceFloat, normalized, difference)
+                    Core.compare(difference, Scalar(threshold), detected, Core.CMP_GT)
+                    Core.bitwise_or(combinedMask, detected, combinedMask)
+                } finally {
+                    gray.release()
+                    normalized.release()
+                    difference.release()
+                    detected.release()
+                }
+            }
+
+            Imgproc.dilate(combinedMask, dilatedMask, kernel)
+            dilatedMask.convertTo(maskFloat, CvType.CV_32FC1, 1.0 / 255.0)
+            Imgproc.GaussianBlur(maskFloat, softMask, CvSize(0.0, 0.0), 2.0)
+            Core.subtract(
+                Mat.ones(softMask.size(), CvType.CV_32FC1),
+                softMask,
+                inverseMask
+            )
+
+            reference.convertTo(composite, CvType.CV_32FC3, 1.0 / 255.0)
+            Core.split(composite, referenceChannels)
+            Core.split(fused, fusedChannels)
+            for (channelIndex in 0..2) {
+                val staticPart = Mat()
+                val movingPart = Mat()
+                val outputChannel = Mat()
+                try {
+                    Core.multiply(fusedChannels[channelIndex], inverseMask, staticPart)
+                    Core.multiply(referenceChannels[channelIndex], softMask, movingPart)
+                    Core.add(staticPart, movingPart, outputChannel)
+                    compositeChannels += outputChannel
+                } finally {
+                    staticPart.release()
+                    movingPart.release()
+                }
+            }
+            Core.merge(compositeChannels, composite)
+            composite.copyTo(fused)
+
+            Core.countNonZero(dilatedMask).toDouble() * 100.0 /
+                (reference.rows().toDouble() * reference.cols().toDouble())
+        } finally {
+            referenceGray.release()
+            referenceFloat.release()
+            combinedMask.release()
+            kernel.release()
+            dilatedMask.release()
+            softMask.release()
+            maskFloat.release()
+            inverseMask.release()
+            referenceChannels.forEach { it.release() }
+            fusedChannels.forEach { it.release() }
+            compositeChannels.forEach { it.release() }
+            composite.release()
+        }
+    }
+
     }
 }
