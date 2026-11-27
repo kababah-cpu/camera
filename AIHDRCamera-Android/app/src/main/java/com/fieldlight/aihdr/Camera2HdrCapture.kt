@@ -49,6 +49,7 @@ data class HdrCaptureDiagnostics(
     val aeCompensationRange: String,
     val aeCompensationStep: String,
     val sensorExposureRangeMs: String,
+    val manualPrimeExposureMs: Double,
     val requestedExposureMs: List<Double>,
     val requestedSensitivityIso: List<Int>,
     val requestedAeCompensation: List<Int>,
@@ -90,6 +91,7 @@ data class HdrCaptureDiagnostics(
         appendLine("AE compensation range: ${aeCompensationRange}")
         appendLine("AE compensation step: ${aeCompensationStep}")
         appendLine("Sensor exposure-time range: ${sensorExposureRangeMs}")
+        if (manualPrimeExposureMs > 0.0) appendLine("Manual priming-frame actual exposure: ${"%.2f".format(Locale.US, manualPrimeExposureMs)} ms")
         appendLine("Requested exposure durations: ${requestedExposureMs.joinToString(", ") { if (it > 0.0) "%.2f".format(Locale.US, it) + " ms" else "AUTO" }}")
         appendLine("Requested ISO values: ${requestedSensitivityIso.joinToString(", ") { if (it > 0) it.toString() else "AUTO" }}")
         appendLine("Requested AE compensation: ${requestedAeCompensation.joinToString(", ")}")
@@ -128,7 +130,7 @@ private data class CapturedFrameTiming(
     val appliedAeMode: Int
 )
 private data class CapturedJpeg(val sensorTimestampNs: Long, val bytes: ByteArray)
-private data class CaptureEvent(val result: TotalCaptureResult? = null, val error: Throwable? = null)
+private data class CaptureEvent(val requestIndex: Int, val result: TotalCaptureResult? = null, val error: Throwable? = null)
 
 private data class HdrFusionTimings(
     val decodeMs: Long,
@@ -338,6 +340,20 @@ class Camera2HdrCapture(context: Context) {
                 }.build()
             }
 
+            // Some camera HALs apply the previous automatic exposure to the first
+            // request after switching CONTROL_MODE/AE to manual. Submit and await one
+            // discarded manual frame first, then begin the measured three-frame bracket.
+            // This keeps the actual HDR sequence tightly queued while priming the HAL.
+            val manualPrimeExposureMs = if (canBracketManually) {
+                val primeResult = captureJpeg(session, requests.first(), queue).second
+                val actualPrimeNs = primeResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+                Log.i(
+                    "AIHDR-Bracket",
+                    "Manual priming frame: requestedExposureNs=${requests.first().get(CaptureRequest.SENSOR_EXPOSURE_TIME)}, actualExposureNs=$actualPrimeNs"
+                )
+                actualPrimeNs / 1_000_000.0
+            } else 0.0
+
             val burstStart = SystemClock.elapsedRealtime()
             val (frames, sensorTimestamps, frameTimings) = captureBurstJpegs(session, requests, queue)
             val burstMs = SystemClock.elapsedRealtime() - burstStart
@@ -376,6 +392,7 @@ class Camera2HdrCapture(context: Context) {
                 aeCompensationRange = compensationRange?.let { "${it.lower}..${it.upper}" } ?: "unavailable",
                 aeCompensationStep = compensationStep?.let { "${it.numerator}/${it.denominator}" } ?: "unavailable",
                 sensorExposureRangeMs = exposureRange?.let { "%.3f..%.3f ms".format(Locale.US, it.lower / 1_000_000.0, it.upper / 1_000_000.0) } ?: "unavailable",
+                manualPrimeExposureMs = manualPrimeExposureMs,
                 requestedExposureMs = frameTimings.map { it.requestedExposureNs / 1_000_000.0 },
                 requestedSensitivityIso = frameTimings.map { it.requestedSensitivityIso },
                 requestedAeCompensation = frameTimings.map { it.requestedAeCompensation },
@@ -472,22 +489,30 @@ class Camera2HdrCapture(context: Context) {
         requests.forEachIndexed { index, request ->
             session.capture(request, object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    events.offer(CaptureEvent(result = result))
+                    val requestIndex = request.tag as? Int ?: index
+                    events.offer(CaptureEvent(requestIndex = requestIndex, result = result))
                 }
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                    events.offer(CaptureEvent(error = IllegalStateException("HDR frame " + (index + 1) + " failed (reason " + failure.reason + ", frame " + failure.frameNumber + ").")))
+                    events.offer(CaptureEvent(requestIndex = index, error = IllegalStateException("HDR frame " + (index + 1) + " failed (reason " + failure.reason + ", frame " + failure.frameNumber + ").")))
                 }
                 override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
-                    events.offer(CaptureEvent(error = IllegalStateException("HDR capture sequence for frame " + (index + 1) + " was aborted.")))
+                    events.offer(CaptureEvent(requestIndex = index, error = IllegalStateException("HDR capture sequence for frame " + (index + 1) + " was aborted.")))
                 }
             }, handler)
         }
 
-        requests.forEachIndexed { index, request ->
+        val resultsByIndex = HashMap<Int, TotalCaptureResult>(requests.size)
+        repeat(requests.size) { callbackIndex ->
             val event = events.poll(8, TimeUnit.SECONDS)
-                ?: error("Timed out waiting for HDR frame " + (index + 1) + " capture metadata.")
+                ?: error("Timed out waiting for HDR frame " + (callbackIndex + 1) + " capture metadata.")
             event.error?.let { throw it }
-            val result = event.result ?: error("HDR frame " + (index + 1) + " returned no capture metadata.")
+            val result = event.result ?: error("HDR frame " + (event.requestIndex + 1) + " returned no capture metadata.")
+            check(event.requestIndex in requests.indices) { "Camera returned an unknown HDR request tag." }
+            check(resultsByIndex.put(event.requestIndex, result) == null) { "Camera returned duplicate HDR capture metadata." }
+        }
+
+        requests.forEachIndexed { index, request ->
+            val result = resultsByIndex[index] ?: error("HDR frame " + (index + 1) + " capture metadata is missing.")
             val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
                 ?: error("HDR frame " + (index + 1) + " has no sensor timestamp.")
             val jpeg = pollJpegForTimestamp(queue, timestamp, 8)
