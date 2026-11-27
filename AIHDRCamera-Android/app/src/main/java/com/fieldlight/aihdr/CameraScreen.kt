@@ -57,9 +57,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-@Composable
 private data class CaptureUiResult(val uri: Uri, val diagnostics: String?)
 
+@Composable
 fun CameraScreen() {
     val context = LocalContext.current
     val activity = context as? android.app.Activity
