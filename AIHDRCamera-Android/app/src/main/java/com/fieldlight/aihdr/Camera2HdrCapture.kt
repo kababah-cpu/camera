@@ -354,21 +354,23 @@ private object HdrFusion {
 
                 val curve = ByteArray(256) { value ->
                     val x = value / 255.0
-                    // A restrained shadow lift that approaches zero in highlights.
-                    val mapped = (x + 12.0 * (1.0 - x) * (1.0 - x)).coerceIn(0.0, 1.0)
+                    // Gentle toe lift: the previous coefficient of 12.0 clipped most
+                    // midtones and highlights to white. Keep the lift subtle and
+                    // progressively smaller toward bright values.
+                    val mapped = (x + 0.18 * (1.0 - x) * (1.0 - x)).coerceIn(0.0, 1.0)
                     (mapped * 255.0).toInt().toByte()
                 }
                 toneCurve.put(0, 0, curve)
                 Core.LUT(luma, toneCurve, localContrast)
 
-                val clahe = Imgproc.createCLAHE(1.25, CvSize(12.0, 12.0))
+                val clahe = Imgproc.createCLAHE(1.05, CvSize(16.0, 16.0))
                 try {
                     val claheLuma = Mat()
                     try {
                         clahe.apply(localContrast, claheLuma)
                         // Blend gently: retain the global tonal structure and use CLAHE
                         // only to reveal local detail in shaded walls, trees and windows.
-                        Core.addWeighted(localContrast, 0.68, claheLuma, 0.32, 0.0, blendedLuma)
+                        Core.addWeighted(localContrast, 0.85, claheLuma, 0.15, 0.0, blendedLuma)
                     } finally {
                         claheLuma.release()
                     }
@@ -379,7 +381,7 @@ private object HdrFusion {
                 // Very mild luminance-only sharpening restores edge definition without
                 // creating colored halos around rooflines, branches or building edges.
                 Imgproc.GaussianBlur(blendedLuma, blurredLuma, CvSize(0.0, 0.0), 1.0)
-                Core.addWeighted(blendedLuma, 1.10, blurredLuma, -0.10, 0.0, sharpenedLuma)
+                Core.addWeighted(blendedLuma, 1.04, blurredLuma, -0.04, 0.0, sharpenedLuma)
                 sharpenedLuma.copyTo(channels[0])
                 Core.merge(channels, lab)
                 Imgproc.cvtColor(lab, output, Imgproc.COLOR_Lab2BGR)
