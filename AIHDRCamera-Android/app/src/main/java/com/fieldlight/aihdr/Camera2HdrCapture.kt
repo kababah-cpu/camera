@@ -1,6 +1,7 @@
 package com.fieldlight.aihdr
 
 import android.content.Context
+import android.graphics.Rect
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -9,6 +10,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.TotalCaptureResult
 import android.media.ImageReader
 import android.os.Handler
@@ -35,6 +37,8 @@ import kotlin.math.pow
 
 data class HdrCaptureDiagnostics(
     val meteringMs: Long,
+    val detectedFaceCount: Int,
+    val subjectMeteringApplied: Boolean,
     val burstMs: Long,
     val frameOffsetsMs: List<Long>,
     val frameExposureMs: List<Double>,
@@ -60,6 +64,8 @@ data class HdrCaptureDiagnostics(
         appendLine("AI HDR Camera - Capture Diagnostics")
         appendLine("Total shutter-to-save: ${shutterToSavedMs} ms")
         appendLine("Metering capture: ${meteringMs} ms")
+        appendLine("Faces detected for metering: ${detectedFaceCount}")
+        appendLine("Subject AE region applied: ${if (subjectMeteringApplied) "YES" else "NO"}")
         appendLine("Three-frame burst: ${burstMs} ms")
         frameOffsetsMs.forEachIndexed { index, offset ->
             appendLine("Frame ${index + 1} sensor-time offset: ${offset} ms")
@@ -163,17 +169,64 @@ class Camera2HdrCapture(context: Context) {
             val afMode = if (afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO))
                 CaptureRequest.CONTROL_AF_MODE_AUTO else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
 
+            val faceModes = characteristics.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES) ?: intArrayOf()
+            val faceMode = when {
+                faceModes.contains(CaptureRequest.STATISTICS_FACE_DETECT_MODE_FULL) -> CaptureRequest.STATISTICS_FACE_DETECT_MODE_FULL
+                faceModes.contains(CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE) -> CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE
+                else -> CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF
+            }
             val meterRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                 addTarget(reader.surface)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
                 set(CaptureRequest.CONTROL_AF_MODE, afMode)
                 set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                if (faceMode != CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF) {
+                    set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, faceMode)
+                }
                 set(CaptureRequest.JPEG_QUALITY, 96.toByte())
                 set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             }.build()
 
-            val (_, meterResult) = captureJpeg(session, meterRequest, queue)
+            val (_, faceResult) = captureJpeg(session, meterRequest, queue)
+            val detectedFaces = faceResult.get(CaptureResult.STATISTICS_FACES).orEmpty()
+            val maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0
+            val activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            val selectedFace = detectedFaces.filter { it.score >= 50 }.maxByOrNull { face ->
+                face.bounds.width().toLong() * face.bounds.height().toLong()
+            }
+            val subjectRegion = if (maxAeRegions > 0 && activeArray != null && selectedFace != null) {
+                val bounds = selectedFace.bounds
+                // Include the face and a generous upper-body margin, while excluding
+                // as much bright background as practical.
+                val halfWidth = (bounds.width() * 1.0f).toInt()
+                val topMargin = (bounds.height() * 0.5f).toInt()
+                val bottomMargin = (bounds.height() * 2.5f).toInt()
+                val regionRect = Rect(
+                    bounds.left - halfWidth,
+                    bounds.top - topMargin,
+                    bounds.right + halfWidth,
+                    bounds.bottom + bottomMargin
+                )
+                if (regionRect.intersect(activeArray)) MeteringRectangle(regionRect, MeteringRectangle.METERING_WEIGHT_MAX) else null
+            } else null
+            val meterResult = if (subjectRegion != null) {
+                val subjectMeterRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(reader.surface)
+                    set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                    set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(subjectRegion))
+                    set(CaptureRequest.CONTROL_AF_MODE, afMode)
+                    set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                    set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                    if (faceMode != CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF) {
+                        set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, faceMode)
+                    }
+                    set(CaptureRequest.JPEG_QUALITY, 96.toByte())
+                    set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+                }.build()
+                captureJpeg(session, subjectMeterRequest, queue).second
+            } else faceResult
             exposureNs = meterResult.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: exposureNs
             sensitivity = meterResult.get(CaptureResult.SENSOR_SENSITIVITY) ?: sensitivity
             val meteringMs = SystemClock.elapsedRealtime() - meterStart
@@ -250,6 +303,8 @@ class Camera2HdrCapture(context: Context) {
             val fusionOutput = HdrFusion.merge(frames)
             val diagnostics = HdrCaptureDiagnostics(
                 meteringMs = meteringMs,
+                detectedFaceCount = detectedFaces.size,
+                subjectMeteringApplied = subjectRegion != null,
                 burstMs = burstMs,
                 frameOffsetsMs = frameOffsetsMs,
                 frameExposureMs = frameTimings.map { it.exposureNs / 1_000_000.0 },
