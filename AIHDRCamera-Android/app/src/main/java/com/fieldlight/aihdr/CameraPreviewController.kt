@@ -21,6 +21,7 @@ import android.util.Size
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 class CameraPreviewController(private val context: Context) : TextureView.SurfaceTextureListener {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -198,7 +199,7 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
             publishStatus()
             return
         }
-        val target = ((targetEv / aeStepEv).toInt()).coerceIn(aeLower, aeUpper)
+        val target = (targetEv / aeStepEv).roundToInt().coerceIn(aeLower, aeUpper)
         val now = SystemClock.elapsedRealtime()
         if (now - lastAppliedMs < 280L && !force) {
             publishStatus()
