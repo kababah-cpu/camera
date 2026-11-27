@@ -41,7 +41,9 @@ data class HdrCaptureDiagnostics(
     val fusionMs: Long,
     val finishingMs: Long,
     val jpegEncodingMs: Long,
-    val exposureRatio: Double?
+    val exposureRatio: Double?,
+    val opencvThreads: Int,
+    val alignmentMaxBits: Int
 ) {
     fun toReport(shutterToSavedMs: Long): String = buildString {
         appendLine("AI HDR Camera - Capture Diagnostics")
@@ -57,6 +59,8 @@ data class HdrCaptureDiagnostics(
         appendLine("Exposure fusion: ${fusionMs} ms")
         appendLine("Tone/contrast/sharpening: ${finishingMs} ms")
         appendLine("JPEG encoding: ${jpegEncodingMs} ms")
+        appendLine("OpenCV processing threads: ${opencvThreads}")
+        appendLine("Alignment pyramid max bits: ${alignmentMaxBits}")
         exposureRatio?.let { appendLine("Measured exposure ratio: ${"%.2f".format(Locale.US, it)}x") }
     }
 }
@@ -206,7 +210,9 @@ class Camera2HdrCapture(context: Context) {
                 fusionMs = fusionOutput.timings.fusionMs,
                 finishingMs = fusionOutput.timings.finishingMs,
                 jpegEncodingMs = fusionOutput.timings.jpegEncodingMs,
-                exposureRatio = null
+                exposureRatio = null,
+                opencvThreads = Core.getNumThreads(),
+                alignmentMaxBits = HdrFusion.ALIGNMENT_MAX_BITS
             )
             HdrCaptureOutput(fusionOutput.jpeg, diagnostics)
         }
@@ -434,9 +440,14 @@ class Camera2HdrCapture(context: Context) {
 }
 
 private object HdrFusion {
+    const val ALIGNMENT_MAX_BITS = 5
+    private const val OPENCV_THREADS = 4
+
     fun merge(jpegs: List<ByteArray>): HdrFusionOutput {
         require(jpegs.size == 3) { "HDR processing requires three frames." }
-        val totalStart = SystemClock.elapsedRealtime()
+        // The Hot 60i has a heterogeneous 8-core CPU. Four OpenCV workers are
+        // a conservative starting point; the timing report records this setting.
+        Core.setNumThreads(OPENCV_THREADS)
         val decodeStart = SystemClock.elapsedRealtime()
         val encodedInputs = jpegs.map { MatOfByte(*it) }
         val source = ArrayList<Mat>()
@@ -463,7 +474,9 @@ private object HdrFusion {
 
             val alignmentStart = SystemClock.elapsedRealtime()
             try {
-                Photo.createAlignMTB().process(source, aligned)
+                val aligner = Photo.createAlignMTB()
+                aligner.setMaxBits(ALIGNMENT_MAX_BITS)
+                aligner.process(source, aligned)
             } catch (_: Exception) {
                 aligned.clear()
             }
