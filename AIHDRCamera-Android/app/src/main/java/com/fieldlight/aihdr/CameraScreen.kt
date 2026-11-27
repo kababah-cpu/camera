@@ -219,12 +219,12 @@ fun CameraScreen() {
                                             val jpegOrientation = camera.jpegOrientation(frontCamera, displayRotation)
                                             if (hdrEnabled) {
                                                 val hdr = camera.captureHdr(exposureBoost.toDouble(), frontCamera, jpegOrientation)
-                                                val uri = savePhoto(context, hdr.jpeg, jpegOrientation)
+                                                val uri = savePhoto(context, hdr.jpeg, jpegOrientation).getOrThrow()
                                                 val totalMs = SystemClock.elapsedRealtime() - shutterStartMs
                                                 Result.success(CaptureUiResult(uri, hdr.diagnostics.toReport(totalMs)))
                                             } else {
                                                 val bytes = camera.captureStandard(frontCamera, jpegOrientation)
-                                                Result.success(CaptureUiResult(savePhoto(context, bytes, jpegOrientation), null))
+                                                Result.success(CaptureUiResult(savePhoto(context, bytes, jpegOrientation).getOrThrow(), null))
                                             }
                                         } catch (error: Exception) {
                                             Result.failure<CaptureUiResult>(error)
