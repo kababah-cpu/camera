@@ -34,6 +34,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import org.opencv.android.OpenCVLoader
 import java.text.SimpleDateFormat
@@ -63,6 +65,30 @@ fun CameraScreen() {
     val preview = remember { CameraPreviewController(context) }
     val camera = remember { Camera2HdrCapture(context) }
 
+    // Bound outstanding HDR jobs to keep JPEG/native memory use predictable.
+    val hdrQueue = remember { Channel<Pair<HdrCapturedFrames, Int>>(Channel.UNLIMITED) }
+    val hdrSlots = remember { Semaphore(2) }
+
+    LaunchedEffect(camera) {
+        for ((capturedFrames, orientation) in hdrQueue) {
+            try {
+                val hdr = withContext(Dispatchers.Default) {
+                    if (!OpenCVLoader.initLocal()) error("OpenCV initialization failed")
+                    camera.processHdrFrames(capturedFrames)
+                }
+                val uri = withContext(Dispatchers.IO) {
+                    savePhoto(context, hdr.jpeg, orientation).getOrThrow()
+                }
+                lastPhoto = uri
+                status = "HDR PHOTO SAVED"
+            } catch (error: Exception) {
+                status = error.message ?: "HDR PROCESSING FAILED"
+            } finally {
+                hdrSlots.release()
+            }
+        }
+    }
+
     val permissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         hasPermission = it
         if (it) textureView?.let { view -> preview.attach(view, frontCamera) }
@@ -71,7 +97,7 @@ fun CameraScreen() {
         if (hasPermission) textureView?.let { preview.attach(it, frontCamera) }
     }
     DisposableEffect(Unit) {
-        onDispose { preview.release(); camera.close() }
+        onDispose { hdrQueue.close(); preview.release(); camera.close() }
     }
 
     Box(Modifier.fillMaxSize().background(CamBlack)) {
@@ -146,31 +172,43 @@ fun CameraScreen() {
                 }
 
                 Box(Modifier.size(84.dp).clip(CircleShape).border(5.dp, Color.White, CircleShape).clickable(enabled = hasPermission && !busy) {
+                    if (hdrEnabled && !hdrSlots.tryAcquire()) {
+                        status = "HDR QUEUE FULL — WAIT FOR A PHOTO TO FINISH"
+                        return@clickable
+                    }
+                    var reservedHdrSlot = hdrEnabled
                     busy = true
                     status = if (hdrEnabled) "CAPTURING HDR…" else "CAPTURING…"
                     preview.stopPreview()
-                    val shutterStartMs = SystemClock.elapsedRealtime()
                     scope.launch {
-                        val result = withContext(Dispatchers.IO) {
-                            runCatching {
-                                if (hdrEnabled && !OpenCVLoader.initLocal()) error("OpenCV initialization failed")
-                                @Suppress("DEPRECATION")
-                                val rotation = activity?.windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
-                                val orientation = camera.jpegOrientation(frontCamera, rotation)
-                                val uri = if (hdrEnabled) {
-                                    val hdr = camera.captureHdr(exposureBoost.toDouble(), frontCamera, orientation)
-                                    savePhoto(context, hdr.jpeg, orientation).getOrThrow()
-                                } else {
+                        try {
+                            @Suppress("DEPRECATION")
+                            val rotation = activity?.windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+                            val orientation = camera.jpegOrientation(frontCamera, rotation)
+                            if (hdrEnabled) {
+                                val captured = withContext(Dispatchers.IO) {
+                                    camera.captureHdrFrames(exposureBoost.toDouble(), frontCamera, orientation)
+                                }
+                                textureView?.surfaceTexture?.let { preview.startPreview(it) }
+                                hdrQueue.send(captured to orientation)
+                                status = "HDR PROCESSING IN BACKGROUND"
+                                reservedHdrSlot = false
+                            } else {
+                                val uri = withContext(Dispatchers.IO) {
                                     val comp = preview.currentExposureCompensation()
                                     val jpeg = camera.captureStandard(frontCamera, orientation, comp)
                                     savePhoto(context, jpeg, orientation).getOrThrow()
                                 }
-                                uri
+                                lastPhoto = uri
+                                status = "PHOTO SAVED"
                             }
+                        } catch (error: Exception) {
+                            status = error.message ?: "CAPTURE FAILED"
+                        } finally {
+                            if (reservedHdrSlot) hdrSlots.release()
+                            textureView?.surfaceTexture?.let { preview.startPreview(it) }
+                            busy = false
                         }
-                        result.fold({ lastPhoto = it; status = "PHOTO SAVED" }, { status = it.message ?: "CAPTURE FAILED" })
-                        textureView?.surfaceTexture?.let { preview.startPreview(it) }
-                        busy = false
                     }
                 }, contentAlignment = Alignment.Center) {
                     if (busy) CircularProgressIndicator(Modifier.size(38.dp), color = CamGreen, strokeWidth = 3.dp)
