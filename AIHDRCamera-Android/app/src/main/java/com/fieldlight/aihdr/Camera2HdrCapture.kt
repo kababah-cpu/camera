@@ -88,6 +88,17 @@ data class HdrCaptureDiagnostics(
 
 data class HdrCaptureOutput(val jpeg: ByteArray, val diagnostics: HdrCaptureDiagnostics)
 
+data class HdrCapturedFrames(
+    val frames: List<ByteArray>,
+    val meteringMs: Long,
+    val burstMs: Long,
+    val frameOffsetsMs: List<Long>,
+    val frameExposureMs: List<Double>,
+    val frameDurationMs: List<Double>,
+    val frameSensitivityIso: List<Int>,
+    val minimumJpegFrameDurationMs: Double
+)
+
 private data class CapturedFrameTiming(val exposureNs: Long, val frameDurationNs: Long, val sensitivityIso: Int)
 private data class CapturedJpeg(val sensorTimestampNs: Long, val bytes: ByteArray)
 
@@ -170,7 +181,7 @@ class Camera2HdrCapture(context: Context) {
         captureJpeg(session, request, queue).first
     }
 
-    fun captureHdr(ev: Double, front: Boolean, jpegOrientation: Int): HdrCaptureOutput =
+    fun captureHdrFrames(ev: Double, front: Boolean, jpegOrientation: Int): HdrCapturedFrames =
         withCamera(front) { device, session, reader, queue, characteristics ->
             val meterStart = SystemClock.elapsedRealtime()
             var exposureNs = 10_000_000L
@@ -234,7 +245,6 @@ class Camera2HdrCapture(context: Context) {
                                 .coerceIn(exposureRange!!.lower, exposureRange.upper)
                             set(CaptureRequest.SENSOR_EXPOSURE_TIME, adjustedExposure)
                             set(CaptureRequest.SENSOR_SENSITIVITY, sensitivity.coerceIn(isoRange!!.lower, isoRange.upper))
-                            // Request the fastest supported JPEG cadence without shortening exposure.
                             if (minimumJpegFrameDurationNs > 0L) {
                                 set(CaptureRequest.SENSOR_FRAME_DURATION, maxOf(minimumJpegFrameDurationNs, adjustedExposure))
                             }
@@ -263,32 +273,45 @@ class Camera2HdrCapture(context: Context) {
             val frameOffsetsMs = sensorTimestamps.map { timestamp ->
                 if (firstTimestamp > 0L && timestamp >= firstTimestamp) (timestamp - firstTimestamp) / 1_000_000L else -1L
             }
-            val fusionOutput = HdrFusion.merge(frames)
-            val diagnostics = HdrCaptureDiagnostics(
+            HdrCapturedFrames(
+                frames = frames,
                 meteringMs = meteringMs,
                 burstMs = burstMs,
                 frameOffsetsMs = frameOffsetsMs,
                 frameExposureMs = frameTimings.map { it.exposureNs / 1_000_000.0 },
                 frameDurationMs = frameTimings.map { it.frameDurationNs / 1_000_000.0 },
                 frameSensitivityIso = frameTimings.map { it.sensitivityIso },
-                minimumJpegFrameDurationMs = minimumJpegFrameDurationNs / 1_000_000.0,
-                decodeMs = fusionOutput.timings.decodeMs,
-                alignmentMs = fusionOutput.timings.alignmentMs,
-                fusionMs = fusionOutput.timings.fusionMs,
-                finishingMs = fusionOutput.timings.finishingMs,
-                jpegEncodingMs = fusionOutput.timings.jpegEncodingMs,
-                motionSuppressionMs = fusionOutput.timings.motionSuppressionMs,
-                motionMaskCoveragePercent = fusionOutput.timings.motionMaskCoveragePercent,
-                motionMaskRawCoveragePercent = fusionOutput.timings.motionMaskRawCoveragePercent,
-                motionMaskThreshold = fusionOutput.timings.motionMaskThreshold,
-                motionMaskRejected = fusionOutput.timings.motionMaskRejected,
-                middleExposureContributionPercent = fusionOutput.timings.middleExposureContributionPercent,
-                exposureRatio = null,
-                opencvThreads = Core.getNumThreads(),
-                alignmentMaxBits = HdrFusion.ALIGNMENT_MAX_BITS
+                minimumJpegFrameDurationMs = minimumJpegFrameDurationNs / 1_000_000.0
             )
-            HdrCaptureOutput(fusionOutput.jpeg, diagnostics)
         }
+
+    fun processHdrFrames(captured: HdrCapturedFrames): HdrCaptureOutput {
+        val fusionOutput = HdrFusion.merge(captured.frames)
+        val diagnostics = HdrCaptureDiagnostics(
+            meteringMs = captured.meteringMs,
+            burstMs = captured.burstMs,
+            frameOffsetsMs = captured.frameOffsetsMs,
+            frameExposureMs = captured.frameExposureMs,
+            frameDurationMs = captured.frameDurationMs,
+            frameSensitivityIso = captured.frameSensitivityIso,
+            minimumJpegFrameDurationMs = captured.minimumJpegFrameDurationMs,
+            decodeMs = fusionOutput.timings.decodeMs,
+            alignmentMs = fusionOutput.timings.alignmentMs,
+            fusionMs = fusionOutput.timings.fusionMs,
+            finishingMs = fusionOutput.timings.finishingMs,
+            jpegEncodingMs = fusionOutput.timings.jpegEncodingMs,
+            motionSuppressionMs = fusionOutput.timings.motionSuppressionMs,
+            motionMaskCoveragePercent = fusionOutput.timings.motionMaskCoveragePercent,
+            motionMaskRawCoveragePercent = fusionOutput.timings.motionMaskRawCoveragePercent,
+            motionMaskThreshold = fusionOutput.timings.motionMaskThreshold,
+            motionMaskRejected = fusionOutput.timings.motionMaskRejected,
+            middleExposureContributionPercent = fusionOutput.timings.middleExposureContributionPercent,
+            exposureRatio = null,
+            opencvThreads = Core.getNumThreads(),
+            alignmentMaxBits = HdrFusion.ALIGNMENT_MAX_BITS
+        )
+        return HdrCaptureOutput(fusionOutput.jpeg, diagnostics)
+    }
 
     private fun captureJpeg(
         session: CameraCaptureSession,
