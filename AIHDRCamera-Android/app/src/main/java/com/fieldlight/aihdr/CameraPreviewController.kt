@@ -250,31 +250,39 @@ class CameraPreviewController(private val context: Context) : TextureView.Surfac
             else -> 0
         }
 
-        // Camera2 sensor-to-display rotation: rear subtracts display rotation;
-        // front adds it. Mirror only the front preview, never the rear preview.
+        // Apply the sensor/display correction to the TextureView's buffer
+        // matrix. Do not rotate the TextureView itself: doing so rotates its
+        // layout bounds and can leave the visible preview sideways.
         val rotation = if (frontFacing) {
             (sensorOrientation + displayDegrees) % 360
         } else {
             (sensorOrientation - displayDegrees + 360) % 360
         }
-
-        // Rotate the TextureView as a view, then scale the rotated buffer to
-        // cover the viewport. This avoids the previous swapped buffer/view
-        // rectangles which could produce a sideways or inverted preview.
         val swapsDimensions = rotation == 90 || rotation == 270
-        val rotatedWidth = if (swapsDimensions) previewSize.height.toFloat() else previewSize.width.toFloat()
-        val rotatedHeight = if (swapsDimensions) previewSize.width.toFloat() else previewSize.height.toFloat()
-        val scale = max(width.toFloat() / rotatedWidth, height.toFloat() / rotatedHeight)
+        val bufferRect = if (swapsDimensions) {
+            RectF(0f, 0f, previewSize.height.toFloat(), previewSize.width.toFloat())
+        } else {
+            RectF(0f, 0f, previewSize.width.toFloat(), previewSize.height.toFloat())
+        }
+        val viewRect = RectF(0f, 0f, width.toFloat(), height.toFloat())
+        val matrix = Matrix()
+        matrix.setRectToRect(bufferRect, viewRect, Matrix.ScaleToFit.FILL)
 
-        textureView.pivotX = width / 2f
-        textureView.pivotY = height / 2f
-        textureView.rotation = rotation.toFloat()
+        val centerX = width / 2f
+        val centerY = height / 2f
+        val scale = max(
+            height.toFloat() / bufferRect.height(),
+            width.toFloat() / bufferRect.width()
+        )
+        matrix.postScale(scale, scale, centerX, centerY)
+        matrix.postRotate(rotation.toFloat(), centerX, centerY)
 
-        // A front-camera selfie mirror must remain horizontal on the screen
-        // after rotation; choose the local axis that maps to screen-horizontal.
-        val mirrorOnLocalY = rotation == 90 || rotation == 270
-        textureView.scaleX = if (frontFacing && !mirrorOnLocalY) -scale else scale
-        textureView.scaleY = if (frontFacing && mirrorOnLocalY) -scale else scale
+        // Mirror the front-facing preview horizontally for a natural selfie
+        // view. Captured JPEG orientation is handled separately.
+        if (frontFacing) {
+            matrix.postScale(-1f, 1f, centerX, centerY)
+        }
+        textureView.setTransform(matrix)
     }
 
     @Synchronized fun stopPreview() {
