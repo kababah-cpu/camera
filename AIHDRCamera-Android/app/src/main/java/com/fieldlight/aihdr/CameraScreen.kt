@@ -13,41 +13,24 @@ import android.view.TextureView
 import android.view.Surface
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -57,25 +40,26 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-private data class CaptureUiResult(val uri: Uri, val diagnostics: String?)
+private val CamGreen = Color(0xFF00D18F)
+private val CamWhite = Color(0xFFF5F5F5)
+private val CamBlack = Color(0xFF050505)
 
 @Composable
 fun CameraScreen() {
     val context = LocalContext.current
     val activity = context as? android.app.Activity
     val scope = rememberCoroutineScope()
-    var hasPermission by remember {
-        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
-    }
+    var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     var hdrEnabled by remember { mutableStateOf(true) }
-    var exposureBoost by remember { mutableStateOf(0f) }
+    var exposureBoost by remember { mutableFloatStateOf(0f) }
     var busy by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf("Ready") }
-    var meteringStatus by remember { mutableStateOf("Starting scene analysis…") }
+    var status by remember { mutableStateOf("READY") }
     var lastPhoto by remember { mutableStateOf<Uri?>(null) }
-    var hdrReport by remember { mutableStateOf<String?>(null) }
     var frontCamera by remember { mutableStateOf(false) }
     var textureView by remember { mutableStateOf<TextureView?>(null) }
+    var selectedMode by remember { mutableStateOf("AI CAM") }
+    var zoom by remember { mutableIntStateOf(1) }
+    var showQuickSettings by remember { mutableStateOf(false) }
     val preview = remember { CameraPreviewController(context) }
     val camera = remember { Camera2HdrCapture(context) }
 
@@ -83,206 +67,142 @@ fun CameraScreen() {
         hasPermission = it
         if (it) textureView?.let { view -> preview.attach(view, frontCamera) }
     }
-
     LaunchedEffect(hasPermission, textureView, frontCamera) {
-        if (hasPermission) textureView?.let { view -> preview.attach(view, frontCamera) }
+        if (hasPermission) textureView?.let { preview.attach(it, frontCamera) }
     }
-
     DisposableEffect(Unit) {
-        preview.setMeteringListener { summary, _ -> meteringStatus = summary }
-        onDispose {
-            preview.setMeteringListener(null)
-            preview.release()
-            camera.close()
-        }
+        onDispose { preview.release(); camera.close() }
     }
 
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
-        androidx.compose.ui.viewinterop.AndroidView(
-            factory = { viewContext ->
-                TextureView(viewContext).also { view -> textureView = view }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+    Box(Modifier.fillMaxSize().background(CamBlack)) {
+        AndroidView(factory = { TextureView(it).also { view -> textureView = view } }, modifier = Modifier.fillMaxSize())
 
-        Column(
-            modifier = Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 18.dp),
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            // Familiar camera toolbar.
-            Surface(
-                color = Color.Black.copy(alpha = 0.52f),
-                shape = RoundedCornerShape(22.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text("AI CAMERA", color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-                        Text("SMART EXPOSURE", color = Color.White.copy(alpha = 0.68f), style = MaterialTheme.typography.labelSmall)
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(if (hdrEnabled) "HDR" else "PHOTO", color = Color.White, style = MaterialTheme.typography.labelLarge)
-                        Spacer(Modifier.size(8.dp))
-                        Switch(checked = hdrEnabled, onCheckedChange = { hdrEnabled = it })
-                    }
-                }
-            }
-
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (!hasPermission) {
-                    Surface(color = Color.Black.copy(alpha = 0.72f), shape = RoundedCornerShape(18.dp)) {
-                        Column(Modifier.fillMaxWidth().padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text("Camera access is required to use the viewfinder.", color = Color.White)
-                            Spacer(Modifier.height(12.dp))
-                            Button(onClick = { permissionRequest.launch(Manifest.permission.CAMERA) }) {
-                                Text("Allow camera")
-                            }
-                        }
-                    }
-                } else {
-                    Surface(color = Color.Black.copy(alpha = 0.66f), shape = RoundedCornerShape(18.dp)) {
-                        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp)) {
-                            Text("EXPOSURE", color = Color.White, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
-                            Slider(
-                                value = exposureBoost,
-                                onValueChange = {
-                                    exposureBoost = it
-                                    preview.setExposureBias(it)
-                                },
-                                valueRange = -1f..2f,
-                                enabled = !busy
-                            )
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text("−1 EV", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelSmall)
-                                Text(String.format(Locale.US, "%+.1f EV", exposureBoost), color = Color.White, style = MaterialTheme.typography.labelMedium)
-                                Text("+2 EV", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
-                    }
-
-                    Surface(color = Color.Black.copy(alpha = 0.62f), shape = RoundedCornerShape(14.dp)) {
-                        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp)) {
-                            Text(meteringStatus, color = Color.White, style = MaterialTheme.typography.labelSmall, maxLines = 2)
-                            Spacer(Modifier.height(4.dp))
-                            Text(status, color = Color.White.copy(alpha = 0.78f), style = MaterialTheme.typography.labelSmall)
-                        }
-                    }
-
-                    if (hdrReport != null) {
-                        Surface(color = Color.Black.copy(alpha = 0.72f), shape = RoundedCornerShape(14.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("HDR diagnostics ready", color = Color.White, style = MaterialTheme.typography.labelMedium)
-                                Button(
-                                    onClick = {
-                                        val report = hdrReport ?: return@Button
-                                        scope.launch {
-                                            val saved = withContext(Dispatchers.IO) {
-                                                runCatching { saveHdrReport(context, report) }
-                                            }
-                                            status = if (saved.isSuccess) "Report saved in Downloads / AI HDR Camera"
-                                                else saved.exceptionOrNull()?.message ?: "Could not save report"
-                                        }
-                                    },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFC857), contentColor = Color.Black)
-                                ) { Text("Save report") }
-                            }
-                        }
-                    }
-
-                    // Standard gallery / shutter / camera-switch control cluster.
-                    Surface(color = Color.Black.copy(alpha = 0.72f), shape = RoundedCornerShape(28.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 14.dp),
-                            horizontalArrangement = Arrangement.SpaceAround,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Button(
-                                onClick = {
-                                    lastPhoto?.let { uri ->
-                                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                                            setDataAndType(uri, "image/jpeg")
-                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                        }
-                                        context.startActivity(intent)
-                                    }
-                                },
-                                enabled = lastPhoto != null,
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
-                            ) { Text("Gallery") }
-
-                            Button(
-                                onClick = {
-                                    if (busy) return@Button
-                                    busy = true
-                                    hdrReport = null
-                                    status = if (hdrEnabled) "Capturing HDR…" else "Capturing photo…"
-                                    preview.stopPreview()
-                                    val shutterStartMs = SystemClock.elapsedRealtime()
-                                    scope.launch {
-                                        val result = withContext(Dispatchers.IO) {
-                                            try {
-                                                if (hdrEnabled && !OpenCVLoader.initLocal()) {
-                                                    error("OpenCV could not initialize. Standard mode is still available.")
-                                                }
-                                                @Suppress("DEPRECATION")
-                                                val displayRotation = activity?.windowManager?.defaultDisplay?.rotation
-                                                    ?: Surface.ROTATION_0
-                                                val jpegOrientation = camera.jpegOrientation(frontCamera, displayRotation)
-                                                if (hdrEnabled) {
-                                                    // Keep the reference HDR capture/fusion path unchanged.
-                                                    val hdr = camera.captureHdr(exposureBoost.toDouble(), frontCamera, jpegOrientation)
-                                                    val uri = savePhoto(context, hdr.jpeg, jpegOrientation).getOrThrow()
-                                                    val totalMs = SystemClock.elapsedRealtime() - shutterStartMs
-                                                    Result.success(CaptureUiResult(uri, hdr.diagnostics.toReport(totalMs)))
-                                                } else {
-                                                    val appliedCompensation = preview.currentExposureCompensation()
-                                                    val bytes = camera.captureStandard(frontCamera, jpegOrientation, appliedCompensation)
-                                                    Result.success(CaptureUiResult(savePhoto(context, bytes, jpegOrientation).getOrThrow(), null))
-                                                }
-                                            } catch (error: Exception) {
-                                                Result.failure<CaptureUiResult>(error)
-                                            }
-                                        }
-                                        result.fold(
-                                            onSuccess = {
-                                                lastPhoto = it.uri
-                                                hdrReport = it.diagnostics
-                                                status = "Photo saved"
-                                            },
-                                            onFailure = { status = it.message ?: "Capture failed" }
-                                        )
-                                        textureView?.surfaceTexture?.let { preview.startPreview(it) }
-                                        busy = false
-                                    }
-                                },
-                                enabled = !busy && hasPermission,
-                                shape = CircleShape,
-                                modifier = Modifier.size(86.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFC857), contentColor = Color.Black)
-                            ) {
-                                if (busy) CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(30.dp))
-                                else Text("SHUTTER", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
-                            }
-
-                            Button(
-                                onClick = {
-                                    frontCamera = !frontCamera
-                                    preview.setFacing(frontCamera)
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
-                            ) { Text("Flip") }
-                        }
-                    }
-                }
+        // Composition grid, matching the reference camera viewfinder.
+        Canvas(Modifier.fillMaxSize()) {
+            val sx = size.width / 3f
+            val sy = size.height / 3f
+            val line = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx())
+            for (i in 1..2) {
+                drawLine(Color.White.copy(alpha = 0.42f), androidx.compose.ui.geometry.Offset(sx * i, 0f), androidx.compose.ui.geometry.Offset(sx * i, size.height), 1.dp.toPx())
+                drawLine(Color.White.copy(alpha = 0.42f), androidx.compose.ui.geometry.Offset(0f, sy * i), androidx.compose.ui.geometry.Offset(size.width, sy * i), 1.dp.toPx())
             }
         }
+
+        Column(Modifier.fillMaxSize()) {
+            // Top camera controls.
+            Row(
+                Modifier.fillMaxWidth().height(76.dp).background(CamBlack).padding(horizontal = 22.dp),
+                horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
+            ) {
+                TopCamControl("◎", "Focus") { status = "Tap the preview to focus" }
+                TopCamControl(if (showQuickSettings) "ϟ" else "ϟ⊘", "Flash") { status = "Flash: auto" }
+                Box(Modifier.size(68.dp, 44.dp).clip(RoundedCornerShape(28.dp)).background(Color(0xFF202020)).clickable { showQuickSettings = !showQuickSettings }, contentAlignment = Alignment.Center) {
+                    Text(if (showQuickSettings) "⌄" else "⌃", color = CamWhite, fontSize = 27.sp)
+                }
+                TopCamControl("50M", "Resolution") { status = "50 MP sensor mode (camera output may be lower)" }
+                TopCamControl("♧", "Filters") { status = "Natural colour profile" }
+                TopCamControl("▣", "Aspect ratio") { status = "4:3 capture" }
+            }
+
+            if (showQuickSettings) {
+                Row(Modifier.fillMaxWidth().background(Color(0xDD111111)).padding(12.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    Text("HDR", color = CamWhite)
+                    Switch(checked = hdrEnabled, onCheckedChange = { hdrEnabled = it })
+                    Text("Exposure", color = CamWhite)
+                    Text(String.format(Locale.US, "%+.1f", exposureBoost), color = CamGreen)
+                    Slider(value = exposureBoost, onValueChange = { exposureBoost = it; preview.setExposureBias(it) }, valueRange = -1f..2f, modifier = Modifier.weight(1f))
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // Zoom selector.
+            Row(Modifier.fillMaxWidth().padding(bottom = 26.dp), horizontalArrangement = Arrangement.Center) {
+                Row(Modifier.clip(CircleShape).background(Color(0xAA292929)).padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    listOf(1, 2).forEach { factor ->
+                        Box(Modifier.size(54.dp, 42.dp).clip(CircleShape).background(if (zoom == factor) Color(0xFF171717) else Color.Transparent).clickable { zoom = factor }, contentAlignment = Alignment.Center) {
+                            Text(if (factor == 1) "1x" else "2", color = if (zoom == factor) CamGreen else CamWhite, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+                        }
+                    }
+                }
+            }
+
+            // Mode selector.
+            Row(Modifier.fillMaxWidth().height(58.dp).background(Color(0xCC080808)).padding(horizontal = 12.dp), horizontalArrangement = Arrangement.SpaceAround, verticalAlignment = Alignment.CenterVertically) {
+                listOf("LAPSE", "VIDEO", "AI CAM", "PORTRAIT", "SLOW").forEach { mode ->
+                    Text(mode, color = if (selectedMode == mode) CamGreen else CamWhite.copy(alpha = if (mode == "LAPSE" || mode == "SLOW") .35f else .78f), fontSize = 14.sp, fontWeight = if (selectedMode == mode) FontWeight.Bold else FontWeight.Normal, modifier = Modifier.clickable { selectedMode = mode })
+                }
+                Text("☰", color = CamGreen, fontSize = 23.sp, modifier = Modifier.clickable { showQuickSettings = !showQuickSettings })
+            }
+
+            // Shutter strip.
+            Row(Modifier.fillMaxWidth().height(112.dp).background(CamBlack).padding(horizontal = 28.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(62.dp).clip(RoundedCornerShape(7.dp)).background(Color(0xFF262626)).clickable {
+                    lastPhoto?.let { uri ->
+                        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW).apply { setDataAndType(uri, "image/jpeg"); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }) }
+                    }
+                }, contentAlignment = Alignment.Center) {
+                    Text(if (lastPhoto != null) "▣" else "▧", color = CamWhite, fontSize = 27.sp)
+                }
+
+                Box(Modifier.size(84.dp).clip(CircleShape).border(5.dp, Color.White, CircleShape).clickable(enabled = hasPermission && !busy) {
+                    busy = true
+                    status = if (hdrEnabled) "CAPTURING HDR…" else "CAPTURING…"
+                    preview.stopPreview()
+                    val shutterStartMs = SystemClock.elapsedRealtime()
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching {
+                                if (hdrEnabled && !OpenCVLoader.initLocal()) error("OpenCV initialization failed")
+                                @Suppress("DEPRECATION")
+                                val rotation = activity?.windowManager?.defaultDisplay?.rotation ?: Surface.ROTATION_0
+                                val orientation = camera.jpegOrientation(frontCamera, rotation)
+                                val uri = if (hdrEnabled) {
+                                    val hdr = camera.captureHdr(exposureBoost.toDouble(), frontCamera, orientation)
+                                    savePhoto(context, hdr.jpeg, orientation).getOrThrow()
+                                } else {
+                                    val comp = preview.currentExposureCompensation()
+                                    val jpeg = camera.captureStandard(frontCamera, orientation, comp)
+                                    savePhoto(context, jpeg, orientation).getOrThrow()
+                                }
+                                uri
+                            }
+                        }
+                        result.fold({ lastPhoto = it; status = "PHOTO SAVED" }, { status = it.message ?: "CAPTURE FAILED" })
+                        textureView?.surfaceTexture?.let { preview.startPreview(it) }
+                        busy = false
+                    }
+                }, contentAlignment = Alignment.Center) {
+                    if (busy) CircularProgressIndicator(Modifier.size(38.dp), color = CamGreen, strokeWidth = 3.dp)
+                    else Box(Modifier.size(68.dp).clip(CircleShape).background(Color.White))
+                }
+
+                Box(Modifier.size(62.dp).clip(CircleShape).background(Color(0xFF242424)).clickable {
+                    frontCamera = !frontCamera
+                    preview.setFacing(frontCamera)
+                }, contentAlignment = Alignment.Center) {
+                    Text("↻", color = CamWhite, fontSize = 31.sp)
+                }
+            }
+            if (status != "READY") {
+                Text(status, color = CamWhite.copy(alpha = .75f), fontSize = 10.sp, modifier = Modifier.fillMaxWidth().background(CamBlack).padding(bottom = 3.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            }
+        }
+
+        if (!hasPermission) {
+            Column(Modifier.align(Alignment.Center).padding(28.dp).clip(RoundedCornerShape(16.dp)).background(Color(0xEE111111)).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Camera permission is required", color = CamWhite)
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = { permissionRequest.launch(Manifest.permission.CAMERA) }) { Text("Allow camera") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TopCamControl(symbol: String, description: String, onClick: () -> Unit) {
+    Column(Modifier.clickable(onClick = onClick), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(symbol, color = CamWhite, fontSize = 23.sp, fontWeight = FontWeight.Light)
     }
 }
 
