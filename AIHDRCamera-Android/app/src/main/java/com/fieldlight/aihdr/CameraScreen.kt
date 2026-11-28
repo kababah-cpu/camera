@@ -189,7 +189,6 @@ fun CameraScreen() {
                                 val captured = withContext(Dispatchers.IO) {
                                     camera.captureHdrFrames(exposureBoost.toDouble(), frontCamera, orientation)
                                 }
-                                textureView?.surfaceTexture?.let { preview.startPreview(it) }
                                 hdrQueue.send(captured to orientation)
                                 status = "HDR PROCESSING IN BACKGROUND"
                                 reservedHdrSlot = false
